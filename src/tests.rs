@@ -8,6 +8,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use crate::auth::{self, Role};
 use crate::{api, app, db};
 
 struct Client {
@@ -16,9 +17,24 @@ struct Client {
 }
 
 impl Client {
+    /// A fresh system with one admin account (`admin` / `correct horse`).
     fn new() -> Self {
         let conn = db::open(":memory:").unwrap();
-        Client { app: app(api::AppState::new(conn, "correct horse".into(), false)), cookie: None }
+        auth::create_user(&conn, "admin", "Admin", "correct horse", &[Role::Admin]).unwrap();
+        Client { app: app(api::AppState::new(conn, false)), cookie: None }
+    }
+
+    /// Another session against the same system (e.g. a second staff member).
+    fn same_system(&self) -> Self {
+        Client { app: self.app.clone(), cookie: None }
+    }
+
+    async fn login(&mut self, username: &str, password: &str) {
+        self.ok("POST", "/api/login", Some(json!({"username": username, "password": password}))).await;
+    }
+
+    async fn login_admin(&mut self) {
+        self.login("admin", "correct horse").await;
     }
 
     async fn call(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -60,9 +76,11 @@ async fn admin_endpoints_require_login() {
     let mut c = Client::new();
     let (s, _) = c.call("GET", "/api/rooms", None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    let (s, _) = c.call("POST", "/api/login", Some(json!({"password": "nope"}))).await;
+    let (s, _) = c.call("POST", "/api/login", Some(json!({"username": "admin", "password": "nope"}))).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    c.ok("POST", "/api/login", Some(json!({"password": "correct horse"}))).await;
+    let (s, _) = c.call("POST", "/api/login", Some(json!({"username": "nobody", "password": "correct horse"}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    c.login_admin().await;
     c.ok("GET", "/api/rooms", None).await;
     // Public endpoints and the SPA shell work without a session.
     let mut anon = Client::new();
@@ -74,7 +92,7 @@ async fn admin_endpoints_require_login() {
 #[tokio::test]
 async fn full_loan_workflow_with_negotiation() {
     let mut c = Client::new();
-    c.ok("POST", "/api/login", Some(json!({"password": "correct horse"}))).await;
+    c.login_admin().await;
 
     let hall = c.ok("POST", "/api/rooms", Some(json!({"name": "Main Hall"}))).await["id"].as_i64().unwrap();
     let youth = c.ok("POST", "/api/rooms", Some(json!({"name": "Youth Room"}))).await["id"].as_i64().unwrap();
@@ -217,7 +235,7 @@ async fn full_loan_workflow_with_negotiation() {
 #[tokio::test]
 async fn invalid_transitions_and_input_are_rejected() {
     let mut c = Client::new();
-    c.ok("POST", "/api/login", Some(json!({"password": "correct horse"}))).await;
+    c.login_admin().await;
     let room = c.ok("POST", "/api/rooms", Some(json!({"name": "Hall"}))).await["id"].as_i64().unwrap();
     let mic = c.ok("POST", "/api/equipment", Some(json!({"name": "Mic"}))).await["id"].as_i64().unwrap();
     c.ok("PUT", "/api/stock", Some(json!({"room_id": room, "type_id": mic, "quantity": 2}))).await;
@@ -290,4 +308,129 @@ fn demo_seed_loads() {
     assert!(!crate::demo::seed(&conn).unwrap());
     let events = db::load_events(&conn).unwrap();
     assert_eq!(events.len(), 6);
+}
+
+#[tokio::test]
+async fn staff_roles_are_enforced() {
+    let mut admin = Client::new();
+    admin.login_admin().await;
+    let room = admin.ok("POST", "/api/rooms", Some(json!({"name": "Hall"}))).await["id"].as_i64().unwrap();
+    let mic = admin.ok("POST", "/api/equipment", Some(json!({"name": "Mic"}))).await["id"].as_i64().unwrap();
+    let office_id = admin
+        .ok(
+            "POST",
+            "/api/users",
+            Some(json!({"username": "office", "display_name": "Olive Office", "roles": ["bookings"], "password": "office-pass"})),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    admin
+        .ok(
+            "POST",
+            "/api/users",
+            Some(json!({"username": "sound", "display_name": "Sam Sound", "roles": ["av"], "password": "sound-pass"})),
+        )
+        .await;
+    let (s, _) = admin
+        .call("POST", "/api/users", Some(json!({"username": "x", "display_name": "X", "roles": [], "password": "long-enough"})))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "an account needs a role");
+
+    let mut av = admin.same_system();
+    av.login("sound", "sound-pass").await;
+    let me = av.ok("GET", "/api/me", None).await;
+    assert_eq!(me["roles"], json!(["av"]));
+    av.ok("PUT", "/api/stock", Some(json!({"room_id": room, "type_id": mic, "quantity": 2}))).await;
+    let (s, _) = av.call("GET", "/api/users", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    let mut office = admin.same_system();
+    office.login("OFFICE", "office-pass").await; // usernames are case-insensitive
+    let (s, v) = office.call("PUT", "/api/stock", Some(json!({"room_id": room, "type_id": mic, "quantity": 5}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    office.ok("GET", "/api/stock", None).await; // can still see everything
+    office.ok("POST", "/api/groups", Some(json!({"name": "Choir"}))).await; // shared reference data
+    let loan = av
+        .ok(
+            "POST",
+            "/api/loans",
+            Some(json!({"organiser_name": "Pat", "pickup_at": "2030-01-01T10:00", "return_at": "2030-01-02T10:00",
+                        "items": [{"type_id": mic, "quantity": 1}]})),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let (s, _) = office.call("POST", &format!("/api/loans/{loan}/approve"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    av.ok("POST", &format!("/api/loans/{loan}/approve"), Some(json!({}))).await;
+    let detail = av.ok("GET", &format!("/api/loans/{loan}"), None).await;
+    assert_eq!(detail["loan"]["decided_by"], "Sam Sound");
+
+    // Changing your own password keeps you logged in and the old password stops working.
+    let (s, _) = office
+        .call("POST", "/api/me/password", Some(json!({"current_password": "wrong", "new_password": "new-office-pass"})))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    office
+        .ok("POST", "/api/me/password", Some(json!({"current_password": "office-pass", "new_password": "new-office-pass"})))
+        .await;
+    office.ok("GET", "/api/me", None).await;
+    let mut again = admin.same_system();
+    let (s, _) = again.call("POST", "/api/login", Some(json!({"username": "office", "password": "office-pass"}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Disabling an account ends its sessions and blocks login.
+    admin
+        .ok(
+            "PUT",
+            &format!("/api/users/{office_id}"),
+            Some(json!({"username": "office", "display_name": "Olive Office", "roles": ["bookings"], "active": false})),
+        )
+        .await;
+    let (s, _) = office.call("GET", "/api/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = again.call("POST", "/api/login", Some(json!({"username": "office", "password": "new-office-pass"}))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // The last admin can't remove their own admin role, disable or delete themselves.
+    let me = admin.ok("GET", "/api/me", None).await;
+    let admin_id = me["id"].as_i64().unwrap();
+    let (s, _) = admin
+        .call(
+            "PUT",
+            &format!("/api/users/{admin_id}"),
+            Some(json!({"username": "admin", "display_name": "Admin", "roles": ["av"]})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, _) = admin.call("DELETE", &format!("/api/users/{admin_id}"), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn migrations_upgrade_a_pre_accounts_database() {
+    // A database from before staff accounts: old sessions table, user_version 0.
+    let path = std::env::temp_dir().join(format!("roomlog-migrate-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (token TEXT PRIMARY KEY, expires_at TEXT NOT NULL);
+             INSERT INTO sessions VALUES ('old', '2099-01-01T00:00:00');
+             CREATE TABLE rooms (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, notes TEXT NOT NULL DEFAULT '');
+             INSERT INTO rooms(name) VALUES ('Main Hall');",
+        )
+        .unwrap();
+    }
+    let conn = db::open(path.to_str().unwrap()).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert!(version >= 1);
+    let rooms: i64 = conn.query_row("SELECT COUNT(*) FROM rooms", [], |r| r.get(0)).unwrap();
+    assert_eq!(rooms, 1, "existing data is kept");
+    assert_eq!(auth::user_count(&conn).unwrap(), 0);
+    drop(conn);
+    // Re-opening is a no-op.
+    db::open(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
 }

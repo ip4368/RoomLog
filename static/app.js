@@ -63,6 +63,7 @@ async function api(method, path, body) {
   let data = null;
   try { data = await res.json(); } catch (_) { /* empty body */ }
   if (res.status === 401 && path.startsWith('/api/') && !path.startsWith('/api/public') && path !== '/api/login') {
+    me = null;
     navigate('/admin/login');
     throw new ApiError(401, data);
   }
@@ -155,40 +156,68 @@ document.addEventListener('click', (e) => {
 });
 window.addEventListener('popstate', route);
 
+// ------------------------------------------------------------- staff login
+
+/** The logged-in staff member (from /api/me), or null. */
+let me = null;
+
+async function loadMe() {
+  me = await GET('/api/me');
+  return me;
+}
+
+/** Roles: admin (everything), bookings (room bookings), av (equipment & loans). */
+const hasRole = (role) => !!me && (me.roles.includes('admin') || me.roles.includes(role));
+
+const ROLE_LABELS = { admin: 'Admin', bookings: 'Room bookings', av: 'AV & loans' };
+
+/** Read-only note shown instead of action buttons when a role is missing. */
+const needsRoleNote = (role) => h('p', { class: 'muted small' },
+  `Only staff with the "${ROLE_LABELS[role]}" role can change this.`);
+
+// [href, label, role needed to see it (null = all staff), pending-count key]
 const ADMIN_NAV = [
-  ['/admin', 'Requests'],
-  ['/admin/check', 'Quick check'],
-  ['/admin/schedule', 'Schedule'],
-  ['/admin/stock', 'Stock'],
-  ['/admin/equipment', 'Equipment'],
-  ['/admin/rooms', 'Rooms'],
-  ['/admin/groups', 'Groups'],
-  ['/admin/events', 'Church events'],
-  ['/admin/settings', 'Settings'],
+  ['/admin/loans', 'Loans', null, 'pending_loans'],
+  ['/admin/check', 'Quick check', null],
+  ['/admin/schedule', 'Schedule', null],
+  ['/admin/stock', 'Stock', null],
+  ['/admin/equipment', 'Equipment', null],
+  ['/admin/rooms', 'Rooms', null],
+  ['/admin/groups', 'Groups', null],
+  ['/admin/events', 'Church events', null],
+  ['/admin/users', 'Users', 'admin'],
+  ['/admin/settings', 'Settings', null],
 ];
 
 function showNav(path) {
   const nav = document.getElementById('nav');
-  const isAdmin = path.startsWith('/admin') && path !== '/admin/login';
+  const isAdmin = path.startsWith('/admin') && path !== '/admin/login' && !!me;
   nav.hidden = !isAdmin;
   if (!isAdmin) return;
-  nav.replaceChildren(...ADMIN_NAV.map(([href, label]) => {
-    const active = href === '/admin' ? path === '/admin' || path.startsWith('/admin/loans') : path.startsWith(href);
-    return h('a', { href, 'data-link': true, class: active ? 'active' : '' }, label);
+  nav.replaceChildren(...ADMIN_NAV.filter(([, , role]) => !role || hasRole(role)).map(([href, label, , countKey]) => {
+    const count = countKey ? me[countKey] : 0;
+    return h('a', { href, 'data-link': true, class: path.startsWith(href) ? 'active' : '' },
+      label, count ? h('span', { class: 'count' }, count) : null);
   }));
 }
 
+/** Where staff land after logging in. */
+const adminHome = () => '/admin/loans';
+
 async function route() {
   const path = location.pathname.replace(/\/+$/, '') || '/';
-  showNav(path);
   const m = (re) => path.match(re);
   let r;
   try {
+    // Refresh who is logged in (and pending counts) on every console page.
+    if (path.startsWith('/admin') && path !== '/admin/login') await loadMe();
+    showNav(path);
     if (path === '/') return await pageHome();
     if (path === '/request') return await pageRequestForm();
     if ((r = m(/^\/status\/([A-Za-z0-9]+)$/))) return await pageStatus(r[1]);
     if (path === '/admin/login') return pageLogin();
-    if (path === '/admin') return await pageLoans();
+    if (path === '/admin') return navigate(adminHome(), true);
+    if (path === '/admin/loans') return await pageLoans();
     if ((r = m(/^\/admin\/loans\/(\d+)$/))) return await pageLoan(+r[1]);
     if (path === '/admin/check') return await pageCheck();
     if (path === '/admin/schedule') return await pageSchedule();
@@ -198,6 +227,7 @@ async function route() {
     if (path === '/admin/groups') return await pageGroups();
     if (path === '/admin/events') return await pageEvents();
     if (path === '/admin/settings') return await pageSettings();
+    if (path === '/admin/users') return await pageUsers();
     render(h('h1', {}, 'Not found'), h('p', {}, h('a', { href: '/', 'data-link': true }, 'Go home')));
   } catch (e) {
     if (e.status === 401) return;
@@ -226,16 +256,16 @@ function myRequests() {
 }
 
 async function pageHome() {
-  let admin = false;
-  try { await fetch('/api/me', { credentials: 'same-origin' }).then((r) => { admin = r.ok; }); } catch (_) {}
-  if (admin) return navigate('/admin', true);
+  let staff = false;
+  try { await fetch('/api/me', { credentials: 'same-origin' }).then((r) => { staff = r.ok; }); } catch (_) {}
+  if (staff) return navigate('/admin', true);
   const mine = myRequests();
   render(
     h('div', { class: 'hero' },
       h('h1', {}, `${churchName} AV equipment`),
       h('p', { class: 'muted' }, 'Borrow sound and video equipment for your off-site event.'),
       h('a', { class: 'btn primary', href: '/request', 'data-link': true }, 'Request equipment'),
-      h('a', { class: 'btn', href: '/admin/login', 'data-link': true }, 'AV team login')),
+      h('a', { class: 'btn', href: '/admin/login', 'data-link': true }, 'Staff login')),
     mine.length ? h('div', { class: 'card' },
       h('h2', {}, 'Your requests on this device'),
       h('ul', {}, mine.map((r) => h('li', {}, h('a', { href: `/status/${r.token}`, 'data-link': true }, r.label))))) : null,
@@ -395,16 +425,20 @@ async function pageStatus(token) {
 // ------------------------------------------------------------------- admin
 
 function pageLogin() {
+  showNav('/admin/login');
+  const user = h('input', { autocomplete: 'username', autocapitalize: 'none', spellcheck: 'false' });
   const pw = h('input', { type: 'password', autocomplete: 'current-password' });
   const btn = h('button', { class: 'primary', type: 'submit' }, 'Log in');
   const form = h('form', { class: 'card', style: 'max-width:380px;margin:2rem auto' },
-    h('h1', {}, 'AV team login'), field('Password', pw), btn);
+    h('h1', {}, 'Staff login'), field('Username', user), field('Password', pw), btn,
+    h('p', { class: 'muted small' }, 'Forgotten your password? Ask an admin to reset it.'));
   form.addEventListener('submit', busy(btn, async () => {
-    await POST('/api/login', { password: pw.value });
-    navigate('/admin', true);
+    await POST('/api/login', { username: user.value, password: pw.value });
+    await loadMe();
+    navigate(adminHome(), true);
   }));
   render(form);
-  pw.focus();
+  user.focus();
 }
 
 const LOAN_FILTERS = [['open', 'Open'], ['pending', 'Pending'], ['approved', 'Approved'], ['collected', 'Out now'], ['returned', 'Returned'], ['declined', 'Declined'], ['cancelled', 'Cancelled'], ['all', 'All']];
@@ -416,9 +450,9 @@ async function pageLoans() {
   const now = new Date();
   render(
     h('div', { class: 'row' }, h('h1', {}, 'Loan requests'), h('span', { class: 'spacer' }),
-      h('a', { class: 'btn', href: '/request', 'data-link': true }, '+ New request')),
+      hasRole('av') ? h('a', { class: 'btn', href: '/request', 'data-link': true }, '+ New request') : null),
     h('div', { class: 'row', style: 'margin-bottom:0.8rem' }, LOAN_FILTERS.map(([k, label]) =>
-      h('a', { class: 'btn small' + (k === status ? ' primary' : ''), href: `/admin?status=${k}`, 'data-link': true }, label))),
+      h('a', { class: 'btn small' + (k === status ? ' primary' : ''), href: `/admin/loans?status=${k}`, 'data-link': true }, label))),
     loans.length === 0 ? h('p', { class: 'muted' }, 'Nothing here.') :
       h('div', { class: 'card table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, ['Status', 'Event', 'Organiser', 'Pick up', 'Return', 'Items'].map((t) => h('th', {}, t)))),
@@ -486,7 +520,7 @@ function renderEvaluation(ev, refs, ctx = {}) {
     for (const [gid, asks] of byGroup) {
       const g = gid === 'none' ? null : refs.groups[gid];
       const msg = contactMessage(g, asks, refs, ctx);
-      const agreeAll = ctx.loan ? h('button', { class: 'small primary' }, 'They agreed to all') : null;
+      const agreeAll = ctx.loan && hasRole('av') ? h('button', { class: 'small primary' }, 'They agreed to all') : null;
       if (agreeAll) agreeAll.addEventListener('click', busy(agreeAll, async () => {
         for (const a of asks) await agree(a, ctx);
         toast('Recorded');
@@ -505,7 +539,7 @@ function renderEvaluation(ev, refs, ctx = {}) {
           g && g.contact_phone ? h('a', { class: 'btn small', href: `sms:${g.contact_phone.replace(/\s+/g, '')}?&body=${encodeURIComponent(msg)}` }, 'Text') : null,
           agreeAll),
         asks.map((a) => {
-          const btn = ctx.loan ? h('button', { class: 'small' }, 'Agreed') : null;
+          const btn = ctx.loan && hasRole('av') ? h('button', { class: 'small' }, 'Agreed') : null;
           if (btn) btn.addEventListener('click', busy(btn, async () => {
             await agree(a, ctx);
             toast('Recorded');
@@ -581,7 +615,7 @@ async function pageLoan(id) {
     toast(`Marked ${status}`);
   };
 
-  if (loan.status === 'pending') {
+  if (loan.status === 'pending' && hasRole('av')) {
     const ev = d.evaluation;
     if (ev.fully_available) {
       act('Approve & reserve', 'primary', async () => {
@@ -598,25 +632,25 @@ async function pageLoan(id) {
     }
     act('Decline', 'danger', setStatus('declined', 'Decline this request? Put a reason in the message to the organiser first.'));
   }
-  if (loan.status === 'approved') {
+  if (!hasRole('av')) { /* read-only view */ } else if (loan.status === 'approved') {
     act('Mark collected', 'primary', setStatus('collected'));
     act('Back to pending', '', setStatus('pending', 'Release the reserved equipment and return to pending?'));
     act('Cancel loan', 'danger', setStatus('cancelled', 'Cancel this loan? Any agreements with groups for it are released.'));
   }
-  if (loan.status === 'collected') act('Mark returned', 'primary', setStatus('returned'));
-  if (['declined', 'cancelled'].includes(loan.status)) {
+  if (loan.status === 'collected' && hasRole('av')) act('Mark returned', 'primary', setStatus('returned'));
+  if (['declined', 'cancelled'].includes(loan.status) && hasRole('av')) {
     act('Reopen', '', setStatus('pending'));
     act('Delete', 'danger', async () => {
       if (!confirm('Delete this request permanently?')) return false;
       await DEL(`/api/loans/${id}`);
-      navigate('/admin');
+      navigate('/admin/loans');
       return false;
     });
   }
 
   const overdue = loan.status === 'collected' && toDate(loan.return_at) < new Date();
   render(
-    h('div', { class: 'row' }, h('a', { href: '/admin', 'data-link': true, class: 'no-print' }, '← Requests')),
+    h('div', { class: 'row' }, h('a', { href: '/admin/loans', 'data-link': true, class: 'no-print' }, '← Loan requests')),
     h('div', { class: 'row' }, h('h1', {}, loan.event_name || `Request #${loan.id}`), statusBadge(loan.status),
       overdue ? h('span', { class: 'badge declined' }, 'overdue') : null),
     h('div', { class: 'card' },
@@ -629,12 +663,13 @@ async function pageLoan(id) {
         h('dt', {}, 'Pick up'), h('dd', {}, fmtDT(loan.pickup_at)),
         h('dt', {}, 'Return'), h('dd', {}, fmtDT(loan.return_at), h('span', { class: 'muted small' }, ` (+${d.buffer_hours}h turnaround)`)),
         h('dt', {}, 'Requested'), h('dd', {}, loan.items.map((i) => h('span', { class: 'pill' }, `${i.quantity} × ${typeName(refs, i.type_id)}`))),
-        loan.notes ? [h('dt', {}, 'Notes'), h('dd', {}, loan.notes)] : null),
+        loan.notes ? [h('dt', {}, 'Notes'), h('dd', {}, loan.notes)] : null,
+        loan.decided_by ? [h('dt', {}, 'Decided by'), h('dd', {}, loan.decided_by)] : null),
       h('div', { class: 'row no-print', style: 'margin-top:0.8rem' },
         h('span', { class: 'muted small' }, 'Organiser status link:'),
         h('a', { href: `/status/${loan.token}`, target: '_blank', class: 'small' }, 'open'),
         h('button', { class: 'small', onclick: () => copyText(statusLink) }, 'Copy'),
-        loan.status === 'pending' ? h('button', { class: 'small', onclick: () => editLoanDialog(loan, refs, reload) }, 'Edit dates / items') : null)),
+        loan.status === 'pending' && hasRole('av') ? h('button', { class: 'small', onclick: () => editLoanDialog(loan, refs, reload) }, 'Edit dates / items') : null)),
 
     d.competing_pending.length ? h('div', { class: 'banner info' }, 'Other pending requests want the same equipment around these dates: ',
       d.competing_pending.map((c, k) => [k ? ', ' : '', h('a', { href: `/admin/loans/${c.id}`, 'data-link': true }, `#${c.id} ${c.event_name || c.organiser_name}`)]),
@@ -653,10 +688,10 @@ async function pageLoan(id) {
         h('button', { class: 'small', onclick: busy(null, async () => { await DEL(`/api/overrides/${o.id}`); reload(); }) }, 'Undo'))),
       h('p', { class: 'muted small' }, 'These are released automatically if the loan is declined, cancelled or returned.')) : null,
 
-    h('div', { class: 'card no-print' },
+    hasRole('av') ? h('div', { class: 'card no-print' },
       field('Message to organiser', message),
       field('Private notes', notes),
-      saveBtn),
+      saveBtn) : needsRoleNote('av'),
     h('div', { class: 'row no-print' }, actions),
   );
 }
@@ -755,7 +790,7 @@ async function pageSchedule() {
               })),
               o.overrides.filter((x) => x.type_id !== null).map((x) => h('div', { class: 'small muted row' },
                 `${typeName(refs, x.type_id)} → ${x.quantity}${x.note ? ` · ${x.note}` : ''}`,
-                h('button', { class: 'small', onclick: busy(null, async () => { await DEL(`/api/overrides/${x.id}`); reload(); }) }, 'Undo')))),
+                hasRole('av') ? h('button', { class: 'small', onclick: busy(null, async () => { await DEL(`/api/overrides/${x.id}`); reload(); }) }, 'Undo') : null))),
             toggle);
         })])),
   );
@@ -780,7 +815,7 @@ async function pageStock() {
       body.push(h('tr', {},
         h('th', {}, t.name, t.lendable ? null : h('div', { class: 'muted small' }, 'not lendable')),
         rooms.map((r) => {
-          const input = h('input', { type: 'number', min: 0, value: q.get(`${r.id}:${t.id}`) || 0, 'aria-label': `${t.name} in ${r.name}` });
+          const input = h('input', { type: 'number', min: 0, value: q.get(`${r.id}:${t.id}`) || 0, 'aria-label': `${t.name} in ${r.name}`, disabled: !hasRole('av') });
           input.addEventListener('change', async () => {
             try {
               const quantity = Math.max(0, parseInt(input.value || '0', 10));
@@ -798,6 +833,7 @@ async function pageStock() {
   render(
     h('h1', {}, 'Stock by room'),
     h('p', { class: 'muted' }, 'Where each item normally lives. Changes save automatically.'),
+    hasRole('av') ? null : needsRoleNote('av'),
     h('div', { class: 'card table-wrap' }, h('table', { class: 'stock-matrix' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Equipment'), rooms.map((r) => h('th', { class: 'num' }, r.name)), h('th', { class: 'num' }, 'Total'))),
       h('tbody', {}, body))),
@@ -805,7 +841,7 @@ async function pageStock() {
 }
 
 /** Generic list + inline editor page for simple entities. */
-function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, rowLabel }) {
+function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, rowLabel, canEdit = true, editRole }) {
   const editor = h('div');
   const openEditor = (item) => {
     const isNew = !item.id;
@@ -846,13 +882,14 @@ function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, row
   };
   render(
     h('div', { class: 'row' }, h('h1', {}, title), h('span', { class: 'spacer' }),
-      h('button', { class: 'primary', onclick: () => openEditor({ ...blank }) }, `+ Add ${rowLabel}`)),
+      canEdit ? h('button', { class: 'primary', onclick: () => openEditor({ ...blank }) }, `+ Add ${rowLabel}`) : null),
     intro ? h('p', { class: 'muted' }, intro) : null,
+    canEdit ? null : needsRoleNote(editRole),
     editor,
     items.length === 0 ? h('p', { class: 'muted' }, 'None yet.') :
       h('div', { class: 'card table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, columns.map((c) => h('th', { class: c.num ? 'num' : '' }, c.label)))),
-        h('tbody', {}, items.map((it) => h('tr', { class: 'clickable', onclick: () => openEditor(it) },
+        h('tbody', {}, items.map((it) => h('tr', { class: canEdit ? 'clickable' : '', onclick: canEdit ? () => openEditor(it) : null },
           columns.map((c) => h('td', { class: c.num ? 'num' : '' }, c.render ? c.render(it) : it[c.key]))))))),
   );
 }
@@ -872,6 +909,7 @@ async function pageEquipment() {
   const cats = [...new Set(items.map((i) => i.category).filter(Boolean))];
   simpleCrud({
     title: 'Equipment types', rowLabel: 'equipment type', endpoint: '/api/equipment', items,
+    canEdit: hasRole('av'), editRole: 'av',
     intro: 'Kinds of equipment. Set how many are in each room on the Stock page.',
     blank: { name: '', category: '', notes: '', lendable: true },
     columns: [
@@ -1015,28 +1053,115 @@ async function pageEvents() {
 
 async function pageSettings() {
   const s = await GET('/api/settings');
-  const name = h('input', { value: s.church_name });
-  const buffer = h('input', { type: 'number', min: 0, max: 336, value: s.buffer_hours });
+  const isAdmin = hasRole('admin');
+  const name = h('input', { value: s.church_name, disabled: !isAdmin });
+  const buffer = h('input', { type: 'number', min: 0, max: 336, value: s.buffer_hours, disabled: !isAdmin });
   const save = h('button', { class: 'primary', type: 'submit' }, 'Save');
   const form = h('form', { class: 'card' },
+    h('h2', {}, 'Church'),
     field('Church name', name),
-    field('Turnaround buffer (hours)', buffer, { hint: 'How long after a loan is due back before the equipment counts as available again (checking, setting back up).' }),
-    save);
+    field('Equipment turnaround buffer (hours)', buffer, { hint: 'How long after a loan is due back before the equipment counts as available again (checking, setting back up).' }),
+    isAdmin ? save : needsRoleNote('admin'));
   form.addEventListener('submit', busy(save, async () => {
     await PUT('/api/settings', { church_name: name.value, buffer_hours: +buffer.value });
     await loadInfo();
     toast('Saved');
   }));
-  const link = `${location.origin}/request`;
-  const logout = h('button', {}, 'Log out');
-  logout.addEventListener('click', busy(logout, async () => { await POST('/api/logout'); navigate('/', true); }));
+
+  const links = [['Borrow equipment', '/request']];
   render(
     h('h1', {}, 'Settings'),
+    accountCard(),
     form,
-    h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Link for event organisers'),
-      h('p', {}, h('a', { href: link, target: '_blank' }, link)),
-      h('button', { onclick: () => copyText(link) }, 'Copy link')),
-    logout,
+    h('div', { class: 'card' }, h('h2', {}, 'Links for organisers'),
+      links.map(([label, path]) => {
+        const link = `${location.origin}${path}`;
+        return h('div', { class: 'row', style: 'margin-bottom:0.4rem' }, h('strong', {}, label), h('a', { href: link, target: '_blank' }, link),
+          h('button', { class: 'small', onclick: () => copyText(link) }, 'Copy'));
+      })),
+  );
+}
+
+function accountCard() {
+  const current = h('input', { type: 'password', autocomplete: 'current-password' });
+  const next = h('input', { type: 'password', autocomplete: 'new-password', minlength: 8 });
+  const change = h('button', { type: 'submit' }, 'Change password');
+  const form = h('form', {}, h('div', { class: 'grid' }, field('Current password', current), field('New password', next, { hint: 'At least 8 characters' })), change);
+  form.addEventListener('submit', busy(change, async () => {
+    await POST('/api/me/password', { current_password: current.value, new_password: next.value });
+    current.value = next.value = '';
+    toast('Password changed. Other devices have been logged out.');
+  }));
+  const logout = h('button', {}, 'Log out');
+  logout.addEventListener('click', busy(logout, async () => { await POST('/api/logout'); me = null; navigate('/', true); }));
+  return h('div', { class: 'card' },
+    h('div', { class: 'row' }, h('h2', { style: 'margin:0' }, 'Your account'), h('span', { class: 'spacer' }), logout),
+    h('p', {}, `${me.display_name} (${me.username}) · `, me.roles.map((r) => h('span', { class: 'pill' }, ROLE_LABELS[r] || r))),
+    form);
+}
+
+async function pageUsers() {
+  if (!hasRole('admin')) return render(h('h1', {}, 'Users'), needsRoleNote('admin'));
+  const users = await GET('/api/users');
+  const editor = h('div');
+  const openEditor = (u) => {
+    const isNew = !u.id;
+    const username = h('input', { value: u.username, autocapitalize: 'none', spellcheck: 'false' });
+    const display = h('input', { value: u.display_name });
+    const email = h('input', { type: 'email', value: u.email });
+    const password = h('input', { type: 'password', autocomplete: 'new-password' });
+    const active = h('input', { type: 'checkbox', checked: u.active });
+    const roleBoxes = Object.keys(ROLE_LABELS).map((r) => [r, h('input', { type: 'checkbox', checked: u.roles.includes(r) })]);
+    const save = h('button', { class: 'primary', type: 'submit' }, isNew ? 'Add user' : 'Save');
+    const form = h('form', { class: 'card' },
+      h('h2', {}, isNew ? 'Add staff member' : `Edit ${u.display_name}`),
+      h('div', { class: 'grid' },
+        field('Name', display, { required: true }),
+        field('Username', username, { required: true, hint: 'Used to log in' }),
+        field('Email', email),
+        field(isNew ? 'Password' : 'New password', password, { required: isNew, hint: isNew ? 'At least 8 characters. They can change it under Settings.' : 'Leave blank to keep their current password' })),
+      h('div', { class: 'field' }, h('label', {}, 'Roles'),
+        roleBoxes.map(([r, box]) => h('label', { class: 'check' }, box, ROLE_LABELS[r],
+          h('span', { class: 'muted small' }, {
+            admin: ' (users, settings and everything else)',
+            bookings: ' (approve and manage room bookings)',
+            av: ' (equipment, stock and loans)',
+          }[r]))),
+        h('p', { class: 'muted small' }, 'Everyone can see the whole console and edit rooms, groups and church events.')),
+      h('div', { class: 'field' }, h('label', { class: 'check' }, active, 'Account active (untick to block login)')),
+      h('div', { class: 'row' }, save, h('button', { type: 'button', onclick: () => editor.replaceChildren() }, 'Cancel'),
+        isNew || u.id === me.id ? null : h('span', { class: 'spacer' }),
+        isNew || u.id === me.id ? null : h('button', { type: 'button', class: 'danger', onclick: busy(null, async () => {
+          if (!confirm(`Delete ${u.display_name}'s account? (Untick "active" instead to keep their name on past decisions.)`)) return;
+          await DEL(`/api/users/${u.id}`);
+          toast('Deleted');
+          route();
+        }) }, 'Delete')));
+    form.addEventListener('submit', busy(save, async () => {
+      const body = {
+        username: username.value, display_name: display.value, email: email.value, password: password.value,
+        active: active.checked, roles: roleBoxes.filter(([, b]) => b.checked).map(([r]) => r),
+      };
+      if (isNew) await POST('/api/users', body); else await PUT(`/api/users/${u.id}`, body);
+      toast('Saved');
+      route();
+    }));
+    editor.replaceChildren(form);
+    form.scrollIntoView({ behavior: 'smooth' });
+    display.focus();
+  };
+  render(
+    h('div', { class: 'row' }, h('h1', {}, 'Staff accounts'), h('span', { class: 'spacer' }),
+      h('button', { class: 'primary', onclick: () => openEditor({ username: '', display_name: '', email: '', roles: [], active: true }) }, '+ Add user')),
+    h('p', { class: 'muted' }, 'Each staff member logs in with their own account. Their name is recorded on the requests they approve or decline.'),
+    editor,
+    h('div', { class: 'card table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Name', 'Username', 'Roles', ''].map((t) => h('th', {}, t)))),
+      h('tbody', {}, users.map((u) => h('tr', { class: 'clickable', onclick: () => openEditor(u) },
+        h('td', {}, u.display_name, u.email ? h('div', { class: 'muted small' }, u.email) : null),
+        h('td', {}, u.username),
+        h('td', {}, u.roles.map((r) => h('span', { class: 'pill' }, ROLE_LABELS[r] || r))),
+        h('td', {}, u.active ? '' : h('span', { class: 'badge cancelled' }, 'disabled'))))))),
   );
 }
 

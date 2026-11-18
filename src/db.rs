@@ -120,16 +120,49 @@ CREATE TABLE IF NOT EXISTS occurrence_overrides (
 );
 CREATE INDEX IF NOT EXISTS idx_overrides_event ON occurrence_overrides(event_id, occurrence_start);
 
-CREATE TABLE IF NOT EXISTS sessions (
-    token      TEXT PRIMARY KEY,
-    expires_at TEXT NOT NULL
-);
 "#;
 
+/// Schema changes after the original release, applied in order and tracked
+/// with `PRAGMA user_version`. Append only; never edit a released entry.
+const MIGRATIONS: &[&str] = &[
+    // 1: individual staff accounts with roles replace the shared password.
+    r#"
+    DROP TABLE IF EXISTS sessions;
+    CREATE TABLE users (
+        id            INTEGER PRIMARY KEY,
+        username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        display_name  TEXT NOT NULL,
+        email         TEXT NOT NULL DEFAULT '',
+        password_hash TEXT NOT NULL,
+        roles         TEXT NOT NULL,
+        active        INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT NOT NULL
+    );
+    CREATE TABLE sessions (
+        token      TEXT PRIMARY KEY,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL
+    );
+    ALTER TABLE loans ADD COLUMN decided_by TEXT NOT NULL DEFAULT '';
+    "#,
+];
+
 pub fn open(path: &str) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&mut conn)?;
     Ok(conn)
+}
+
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (i, sql) in (1..).zip(MIGRATIONS.iter()).skip(usize::try_from(version).unwrap_or(0)) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.pragma_update(None, "user_version", i64::from(i))?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 pub fn fmt_dt(dt: NaiveDateTime) -> String {

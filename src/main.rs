@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod db;
 mod demo;
 mod engine;
@@ -72,6 +73,34 @@ fn default_db_path() -> String {
     DEFAULT_DB.into()
 }
 
+/// On first start there are no staff accounts: create an `admin` account from
+/// `ADMIN_PASSWORD`. Upgrades from the shared-password version keep working,
+/// since that variable was already set.
+fn bootstrap_admin(conn: &rusqlite::Connection) {
+    let count = auth::user_count(conn).unwrap_or_else(|e| {
+        eprintln!("Failed to read staff accounts: {e}");
+        std::process::exit(1);
+    });
+    let password = std::env::var("ADMIN_PASSWORD").ok();
+    if count > 0 {
+        if password.is_some() {
+            tracing::warn!("ADMIN_PASSWORD is ignored now that staff accounts exist; manage them under Users");
+        }
+        return;
+    }
+    let Some(password) = password else {
+        eprintln!("No staff accounts yet. Set ADMIN_PASSWORD to create the first admin account (username \"admin\").");
+        std::process::exit(1);
+    };
+    match auth::create_user(conn, "admin", "Administrator", &password, &[auth::Role::Admin]) {
+        Ok(_) => tracing::info!("Created admin account \"admin\" from ADMIN_PASSWORD. Add staff accounts under Users."),
+        Err(e) => {
+            eprintln!("Could not create the admin account: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
@@ -95,21 +124,35 @@ async fn main() {
         return;
     }
 
-    let password = match std::env::var("ADMIN_PASSWORD") {
-        Ok(p) if p.len() >= 8 => p,
-        Ok(_) => {
-            eprintln!("ADMIN_PASSWORD must be at least 8 characters");
+    if args.get(1).map(String::as_str) == Some("reset-password") {
+        let Some(username) = args.get(2) else {
+            eprintln!("Usage: roomlog reset-password <username>   (new password is read from stdin)");
+            std::process::exit(2);
+        };
+        eprint!("New password for {username}: ");
+        let mut password = String::new();
+        if std::io::stdin().read_line(&mut password).is_err() {
             std::process::exit(1);
         }
-        Err(_) => {
-            eprintln!("Set ADMIN_PASSWORD to the admin console password (at least 8 characters)");
-            std::process::exit(1);
+        match auth::reset_password(&conn, username, password.trim_end_matches(['\r', '\n'])) {
+            Ok(true) => println!("Password reset for {username}; the account is enabled."),
+            Ok(false) => {
+                eprintln!("No account called {username}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
-    };
+        return;
+    }
+
+    bootstrap_admin(&conn);
     let cookie_secure = matches!(std::env::var("COOKIE_SECURE").as_deref(), Ok("1" | "true" | "yes"));
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
-    let state = api::AppState::new(conn, password, cookie_secure);
+    let state = api::AppState::new(conn, cookie_secure);
     let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| {
         eprintln!("Failed to bind {bind}: {e}");
         std::process::exit(1);

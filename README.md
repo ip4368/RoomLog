@@ -26,14 +26,30 @@ ADMIN_PASSWORD='choose-a-good-password' DATABASE_PATH=roomlog.db ./target/releas
 
 | Environment variable | Default        | Meaning                                                       |
 |----------------------|----------------|---------------------------------------------------------------|
-| `ADMIN_PASSWORD`     | *(required)*   | Password for the AV team console (min 8 chars)                |
+| `ADMIN_PASSWORD`     | *(first run)*  | Creates the first staff account, `admin`, with this password (min 8 chars). Ignored once accounts exist. |
 | `DATABASE_PATH`      | `roomlog.db`   | SQLite file. Back this file up (it's the whole system).       |
 | `BIND`               | `0.0.0.0:8080` | Listen address                                                |
 | `COOKIE_SECURE`      | off            | Set to `1` when served over HTTPS (recommended)               |
 
 > **Upgrading from Quippy:** the project was renamed. If `DATABASE_PATH` isn't set and only
 > the old `quippy.db` exists, RoomLog keeps using it (and says so at startup); rename the file to
-> `roomlog.db` when convenient. AV team members will need to log in once more after upgrading.
+> `roomlog.db` when convenient. The shared password is replaced by individual staff accounts:
+> on first start your existing `ADMIN_PASSWORD` becomes the `admin` account's password. Log in
+> as `admin` and add everyone else under **Users**.
+
+### Staff accounts
+
+Each staff member has their own login. Roles decide what they can change (everyone logged in can
+see everything, and edit rooms, groups and church events):
+
+| Role            | Can                                                  |
+|-----------------|------------------------------------------------------|
+| **Admin**       | Manage staff accounts and settings, and everything below |
+| **Room bookings** | Approve, decline and manage room bookings          |
+| **AV & loans**  | Equipment, stock, equipment loans and "manage with less" agreements |
+
+The name of whoever approves or declines a request is recorded on it. Locked out? Run
+`roomlog reset-password <username>` on the server (it reads the new password from stdin).
 
 Put it behind HTTPS (e.g. Caddy, or a Cloudflare Tunnel) if it's reachable from the internet.
 Browsers only offer to install the PWA, and only enable the service worker, over

@@ -3,9 +3,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use axum::extract::{FromRequestParts, Path, Query, State};
-use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -16,32 +15,30 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::auth::{self, Role, Staff};
 use crate::db::{self, OccurrenceView, fmt_dt, parse_dt};
 use crate::engine::{self, Evaluation, Id};
 use crate::recurrence::{Recurrence, Span};
 
-const SESSION_COOKIE: &str = "roomlog_session";
-const SESSION_DAYS: i64 = 30;
 const MAX_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 100;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
-    pub admin_password: Arc<String>,
     pub cookie_secure: bool,
 }
 
 impl AppState {
-    pub fn new(conn: Connection, admin_password: String, cookie_secure: bool) -> Self {
-        AppState { db: Arc::new(Mutex::new(conn)), admin_password: Arc::new(admin_password), cookie_secure }
+    pub fn new(conn: Connection, cookie_secure: bool) -> Self {
+        AppState { db: Arc::new(Mutex::new(conn)), cookie_secure }
     }
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub fn conn(&self) -> MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-fn now() -> NaiveDateTime {
+pub fn now() -> NaiveDateTime {
     Local::now().naive_local()
 }
 
@@ -51,14 +48,29 @@ fn now() -> NaiveDateTime {
 pub struct ApiError(StatusCode, String, Option<Value>);
 
 impl ApiError {
-    fn bad(msg: impl Into<String>) -> Self {
+    pub fn bad(msg: impl Into<String>) -> Self {
         ApiError(StatusCode::BAD_REQUEST, msg.into(), None)
     }
-    fn not_found() -> Self {
+    pub fn not_found() -> Self {
         ApiError(StatusCode::NOT_FOUND, "Not found".into(), None)
     }
-    fn conflict(msg: impl Into<String>, detail: Option<Value>) -> Self {
+    pub fn unauthorized() -> Self {
+        Self::unauthorized_msg("Please log in")
+    }
+    pub fn unauthorized_msg(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::UNAUTHORIZED, msg.into(), None)
+    }
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        ApiError(StatusCode::FORBIDDEN, msg.into(), None)
+    }
+    pub fn conflict(msg: impl Into<String>, detail: Option<Value>) -> Self {
         ApiError(StatusCode::CONFLICT, msg.into(), detail)
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
     }
 }
 
@@ -91,9 +103,13 @@ impl From<rusqlite::Error> for ApiError {
     }
 }
 
-type ApiResult<T> = Result<Json<T>, ApiError>;
+pub type ApiResult<T> = Result<Json<T>, ApiError>;
 
-fn clean(s: &str, field: &str) -> Result<String, ApiError> {
+pub fn random_token(len: usize) -> String {
+    rand::thread_rng().sample_iter(&Alphanumeric).take(len).map(char::from).collect()
+}
+
+pub fn clean(s: &str, field: &str) -> Result<String, ApiError> {
     let s = s.trim();
     if s.len() > MAX_TEXT {
         return Err(ApiError::bad(format!("{field} is too long")));
@@ -101,7 +117,7 @@ fn clean(s: &str, field: &str) -> Result<String, ApiError> {
     Ok(s.to_string())
 }
 
-fn required(s: &str, field: &str) -> Result<String, ApiError> {
+pub fn required(s: &str, field: &str) -> Result<String, ApiError> {
     let s = clean(s, field)?;
     if s.is_empty() {
         return Err(ApiError::bad(format!("{field} is required")));
@@ -109,93 +125,9 @@ fn required(s: &str, field: &str) -> Result<String, ApiError> {
     Ok(s)
 }
 
-// -------------------------------------------------------------------- auth
-
-pub struct Admin;
-
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|kv| {
-        let (k, v) = kv.trim().split_once('=')?;
-        (k == name).then(|| v.to_string())
-    })
-}
-
-impl FromRequestParts<AppState> for Admin {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let unauth = || ApiError(StatusCode::UNAUTHORIZED, "Please log in".into(), None);
-        let token = cookie_value(&parts.headers, SESSION_COOKIE).ok_or_else(unauth)?;
-        let conn = state.conn();
-        let ok: Option<i64> = conn
-            .query_row("SELECT 1 FROM sessions WHERE token = ?1 AND expires_at > ?2", params![token, fmt_dt(now())], |r| r.get(0))
-            .optional()?;
-        ok.map(|_| Admin).ok_or_else(unauth)
-    }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
-}
-
-fn random_token(len: usize) -> String {
-    rand::thread_rng().sample_iter(&Alphanumeric).take(len).map(char::from).collect()
-}
-
-#[derive(Deserialize)]
-struct LoginIn {
-    password: String,
-}
-
-async fn login(State(st): State<AppState>, Json(body): Json<LoginIn>) -> Result<Response, ApiError> {
-    if !constant_time_eq(body.password.as_bytes(), st.admin_password.as_bytes()) {
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "Wrong password".into(), None));
-    }
-    let token = random_token(48);
-    {
-        let conn = st.conn();
-        conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [fmt_dt(now())])?;
-        conn.execute(
-            "INSERT INTO sessions(token, expires_at) VALUES (?1, ?2)",
-            params![token, fmt_dt(now() + Duration::days(SESSION_DAYS))],
-        )?;
-    }
-    let cookie = format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
-        SESSION_DAYS * 86400,
-        if st.cookie_secure { "; Secure" } else { "" }
-    );
-    let mut resp = Json(json!({ "ok": true })).into_response();
-    resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).expect("ascii cookie"));
-    Ok(resp)
-}
-
-async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    if let Some(t) = cookie_value(&headers, SESSION_COOKIE) {
-        st.conn().execute("DELETE FROM sessions WHERE token = ?1", [t])?;
-    }
-    let mut resp = Json(json!({ "ok": true })).into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("roomlog_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
-    );
-    Ok(resp)
-}
-
-async fn me(_: Admin) -> Json<Value> {
-    Json(json!({ "admin": true }))
-}
-
 // ---------------------------------------------------------------- settings
 
-async fn get_settings(_: Admin, State(st): State<AppState>) -> ApiResult<db::Settings> {
+async fn get_settings(_: Staff, State(st): State<AppState>) -> ApiResult<db::Settings> {
     Ok(Json(db::get_settings(&st.conn())?))
 }
 
@@ -205,7 +137,8 @@ struct SettingsIn {
     buffer_hours: i64,
 }
 
-async fn put_settings(_: Admin, State(st): State<AppState>, Json(b): Json<SettingsIn>) -> ApiResult<db::Settings> {
+async fn put_settings(staff: Staff, State(st): State<AppState>, Json(b): Json<SettingsIn>) -> ApiResult<db::Settings> {
+    staff.require(Role::Admin)?;
     if !(0..=24 * 14).contains(&b.buffer_hours) {
         return Err(ApiError::bad("Buffer must be between 0 and 336 hours"));
     }
@@ -226,14 +159,14 @@ struct RoomDto {
     notes: String,
 }
 
-async fn list_rooms(_: Admin, State(st): State<AppState>) -> ApiResult<Vec<RoomDto>> {
+async fn list_rooms(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<RoomDto>> {
     let conn = st.conn();
     let mut stmt = conn.prepare("SELECT id, name, notes FROM rooms ORDER BY name")?;
     let rows = stmt.query_map([], |r| Ok(RoomDto { id: r.get(0)?, name: r.get(1)?, notes: r.get(2)? }))?;
     Ok(Json(rows.collect::<Result<_, _>>()?))
 }
 
-async fn create_room(_: Admin, State(st): State<AppState>, Json(b): Json<RoomDto>) -> ApiResult<RoomDto> {
+async fn create_room(_: Staff, State(st): State<AppState>, Json(b): Json<RoomDto>) -> ApiResult<RoomDto> {
     let conn = st.conn();
     let name = required(&b.name, "Name")?;
     let notes = clean(&b.notes, "Notes")?;
@@ -241,7 +174,7 @@ async fn create_room(_: Admin, State(st): State<AppState>, Json(b): Json<RoomDto
     Ok(Json(RoomDto { id: conn.last_insert_rowid(), name, notes }))
 }
 
-async fn update_room(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<RoomDto>) -> ApiResult<RoomDto> {
+async fn update_room(_: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<RoomDto>) -> ApiResult<RoomDto> {
     let conn = st.conn();
     let name = required(&b.name, "Name")?;
     let notes = clean(&b.notes, "Notes")?;
@@ -251,7 +184,7 @@ async fn update_room(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, J
     Ok(Json(RoomDto { id, name, notes }))
 }
 
-async fn delete_room(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+async fn delete_room(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
     let conn = st.conn();
     let active: i64 = conn.query_row(
         "SELECT COUNT(*) FROM loan_allocations a JOIN loans l ON l.id = a.loan_id
@@ -306,11 +239,12 @@ fn list_equipment_rows(conn: &Connection) -> rusqlite::Result<Vec<EquipmentDto>>
     rows.collect()
 }
 
-async fn list_equipment(_: Admin, State(st): State<AppState>) -> ApiResult<Vec<EquipmentDto>> {
+async fn list_equipment(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<EquipmentDto>> {
     Ok(Json(list_equipment_rows(&st.conn())?))
 }
 
-async fn create_equipment(_: Admin, State(st): State<AppState>, Json(b): Json<EquipmentDto>) -> ApiResult<EquipmentDto> {
+async fn create_equipment(staff: Staff, State(st): State<AppState>, Json(b): Json<EquipmentDto>) -> ApiResult<EquipmentDto> {
+    staff.require(Role::Av)?;
     let conn = st.conn();
     let (name, category, notes) = (required(&b.name, "Name")?, clean(&b.category, "Category")?, clean(&b.notes, "Notes")?);
     conn.execute(
@@ -321,11 +255,12 @@ async fn create_equipment(_: Admin, State(st): State<AppState>, Json(b): Json<Eq
 }
 
 async fn update_equipment(
-    _: Admin,
+    staff: Staff,
     State(st): State<AppState>,
     Path(id): Path<Id>,
     Json(b): Json<EquipmentDto>,
 ) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     let conn = st.conn();
     let (name, category, notes) = (required(&b.name, "Name")?, clean(&b.category, "Category")?, clean(&b.notes, "Notes")?);
     if conn.execute(
@@ -338,7 +273,8 @@ async fn update_equipment(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn delete_equipment(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+async fn delete_equipment(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     let conn = st.conn();
     let active: i64 = conn.query_row(
         "SELECT COUNT(*) FROM loan_items i JOIN loans l ON l.id = i.loan_id
@@ -362,14 +298,15 @@ struct StockDto {
     quantity: i64,
 }
 
-async fn list_stock(_: Admin, State(st): State<AppState>) -> ApiResult<Vec<StockDto>> {
+async fn list_stock(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<StockDto>> {
     let conn = st.conn();
     let mut stmt = conn.prepare("SELECT room_id, type_id, quantity FROM stock")?;
     let rows = stmt.query_map([], |r| Ok(StockDto { room_id: r.get(0)?, type_id: r.get(1)?, quantity: r.get(2)? }))?;
     Ok(Json(rows.collect::<Result<_, _>>()?))
 }
 
-async fn put_stock(_: Admin, State(st): State<AppState>, Json(b): Json<StockDto>) -> ApiResult<StockDto> {
+async fn put_stock(staff: Staff, State(st): State<AppState>, Json(b): Json<StockDto>) -> ApiResult<StockDto> {
+    staff.require(Role::Av)?;
     if !(0..=100_000).contains(&b.quantity) {
         return Err(ApiError::bad("Quantity must be between 0 and 100000"));
     }
@@ -419,7 +356,7 @@ fn list_group_rows(conn: &Connection) -> rusqlite::Result<Vec<GroupDto>> {
     rows.collect()
 }
 
-async fn list_groups(_: Admin, State(st): State<AppState>) -> ApiResult<Vec<GroupDto>> {
+async fn list_groups(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<GroupDto>> {
     Ok(Json(list_group_rows(&st.conn())?))
 }
 
@@ -434,7 +371,7 @@ fn clean_group(b: &GroupDto) -> Result<GroupDto, ApiError> {
     })
 }
 
-async fn create_group(_: Admin, State(st): State<AppState>, Json(b): Json<GroupDto>) -> ApiResult<GroupDto> {
+async fn create_group(_: Staff, State(st): State<AppState>, Json(b): Json<GroupDto>) -> ApiResult<GroupDto> {
     let conn = st.conn();
     let mut g = clean_group(&b)?;
     conn.execute(
@@ -445,7 +382,7 @@ async fn create_group(_: Admin, State(st): State<AppState>, Json(b): Json<GroupD
     Ok(Json(g))
 }
 
-async fn update_group(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<GroupDto>) -> ApiResult<GroupDto> {
+async fn update_group(_: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<GroupDto>) -> ApiResult<GroupDto> {
     let conn = st.conn();
     let mut g = clean_group(&b)?;
     g.id = id;
@@ -459,7 +396,7 @@ async fn update_group(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, 
     Ok(Json(g))
 }
 
-async fn delete_group(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+async fn delete_group(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
     st.conn().execute("DELETE FROM groups WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -524,7 +461,7 @@ fn event_to_dto(e: &db::EventRow) -> EventDto {
     }
 }
 
-async fn list_events(_: Admin, State(st): State<AppState>) -> ApiResult<Vec<EventDto>> {
+async fn list_events(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<EventDto>> {
     Ok(Json(db::load_events(&st.conn())?.iter().map(event_to_dto).collect()))
 }
 
@@ -609,17 +546,17 @@ fn save_event(conn: &mut Connection, id: Option<Id>, b: &EventDto) -> Result<Id,
     Ok(id)
 }
 
-async fn create_event(_: Admin, State(st): State<AppState>, Json(b): Json<EventDto>) -> ApiResult<Value> {
+async fn create_event(_: Staff, State(st): State<AppState>, Json(b): Json<EventDto>) -> ApiResult<Value> {
     let id = save_event(&mut st.conn(), None, &b)?;
     Ok(Json(json!({ "id": id })))
 }
 
-async fn update_event(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<EventDto>) -> ApiResult<Value> {
+async fn update_event(_: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<EventDto>) -> ApiResult<Value> {
     save_event(&mut st.conn(), Some(id), &b)?;
     Ok(Json(json!({ "id": id })))
 }
 
-async fn delete_event(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+async fn delete_event(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
     st.conn().execute("DELETE FROM events WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -671,7 +608,7 @@ struct ScheduleQuery {
     days: Option<i64>,
 }
 
-async fn schedule(_: Admin, State(st): State<AppState>, Query(q): Query<ScheduleQuery>) -> ApiResult<Value> {
+async fn schedule(_: Staff, State(st): State<AppState>, Query(q): Query<ScheduleQuery>) -> ApiResult<Value> {
     let from = q
         .from
         .as_deref()
@@ -698,7 +635,10 @@ struct OverrideIn {
     loan_id: Option<Id>,
 }
 
-async fn create_override(_: Admin, State(st): State<AppState>, Json(b): Json<OverrideIn>) -> ApiResult<Value> {
+async fn create_override(staff: Staff, State(st): State<AppState>, Json(b): Json<OverrideIn>) -> ApiResult<Value> {
+    if b.type_id.is_some() {
+        staff.require(Role::Av)?;
+    }
     let start = parse_dt(&b.occurrence_start).ok_or_else(|| ApiError::bad("Invalid occurrence start"))?;
     if b.quantity < 0 {
         return Err(ApiError::bad("Quantity cannot be negative"));
@@ -723,8 +663,15 @@ async fn create_override(_: Admin, State(st): State<AppState>, Json(b): Json<Ove
     Ok(Json(json!({ "id": conn.last_insert_rowid() })))
 }
 
-async fn delete_override(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
-    st.conn().execute("DELETE FROM occurrence_overrides WHERE id = ?1", [id])?;
+async fn delete_override(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+    let conn = st.conn();
+    let is_equipment: Option<bool> = conn
+        .query_row("SELECT type_id IS NOT NULL FROM occurrence_overrides WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?;
+    if is_equipment == Some(true) {
+        staff.require(Role::Av)?;
+    }
+    conn.execute("DELETE FROM occurrence_overrides WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -786,6 +733,7 @@ struct LoanDto {
     notes: String,
     admin_notes: String,
     message_to_organiser: String,
+    decided_by: String,
     created_at: NaiveDateTime,
     updated_at: NaiveDateTime,
     items: Vec<ItemDto>,
@@ -793,7 +741,7 @@ struct LoanDto {
 }
 
 const LOAN_COLS: &str = "id, token, status, organiser_name, organisation, email, phone, event_name, event_location,
-    pickup_at, return_at, notes, admin_notes, message_to_organiser, created_at, updated_at";
+    pickup_at, return_at, notes, admin_notes, message_to_organiser, created_at, updated_at, decided_by";
 
 fn row_to_loan(r: &rusqlite::Row) -> rusqlite::Result<LoanDto> {
     let dt = |i: usize| -> rusqlite::Result<NaiveDateTime> { Ok(parse_dt(&r.get::<_, String>(i)?).unwrap_or_default()) };
@@ -814,6 +762,7 @@ fn row_to_loan(r: &rusqlite::Row) -> rusqlite::Result<LoanDto> {
         message_to_organiser: r.get(13)?,
         created_at: dt(14)?,
         updated_at: dt(15)?,
+        decided_by: r.get(16)?,
         items: vec![],
         allocations: vec![],
     })
@@ -899,7 +848,7 @@ struct LoanQuery {
     status: Option<String>,
 }
 
-async fn list_loans(_: Admin, State(st): State<AppState>, Query(q): Query<LoanQuery>) -> ApiResult<Vec<LoanSummary>> {
+async fn list_loans(_: Staff, State(st): State<AppState>, Query(q): Query<LoanQuery>) -> ApiResult<Vec<LoanSummary>> {
     let conn = st.conn();
     let rows = match q.status.as_deref().filter(|s| !s.is_empty() && *s != "all") {
         Some("open") => loan_summaries(&conn, "WHERE l.status IN ('pending','approved','collected')", &[])?,
@@ -1022,12 +971,13 @@ fn public_check(conn: &Connection, ev: &Evaluation) -> rusqlite::Result<PublicCh
     })
 }
 
-async fn create_loan_admin(_: Admin, State(st): State<AppState>, Json(b): Json<LoanIn>) -> ApiResult<Value> {
+async fn create_loan_admin(staff: Staff, State(st): State<AppState>, Json(b): Json<LoanIn>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     let (id, token, _) = insert_loan(&mut st.conn(), &b, false)?;
     Ok(Json(json!({ "id": id, "token": token })))
 }
 
-async fn loan_detail(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+async fn loan_detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
     let conn = st.conn();
     let loan = get_loan(&conn, id)?;
     let s = db::get_settings(&conn)?;
@@ -1082,7 +1032,8 @@ struct LoanPatch {
     items: Option<Vec<ItemIn>>,
 }
 
-async fn patch_loan(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<LoanPatch>) -> ApiResult<Value> {
+async fn patch_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<LoanPatch>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     let mut conn = st.conn();
     let loan = get_loan(&conn, id)?;
     let ts = fmt_dt(now());
@@ -1138,7 +1089,8 @@ struct ApproveIn {
     message: Option<String>,
 }
 
-async fn approve_loan(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<ApproveIn>) -> ApiResult<Value> {
+async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<ApproveIn>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     let mut conn = st.conn();
     let loan = get_loan(&conn, id)?;
     if loan.status != "pending" {
@@ -1188,7 +1140,10 @@ async fn approve_loan(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, 
             params![id, r, t, q],
         )?;
     }
-    tx.execute("UPDATE loans SET status = 'approved', updated_at = ?1 WHERE id = ?2", params![fmt_dt(now), id])?;
+    tx.execute(
+        "UPDATE loans SET status = 'approved', decided_by = ?1, updated_at = ?2 WHERE id = ?3",
+        params![staff.display_name, fmt_dt(now), id],
+    )?;
     if let Some(m) = &b.message {
         tx.execute("UPDATE loans SET message_to_organiser = ?1 WHERE id = ?2", params![clean(m, "Message")?, id])?;
     }
@@ -1210,12 +1165,17 @@ fn transition_allowed(from: &str, to: &str) -> bool {
     )
 }
 
-fn set_status(conn: &mut Connection, loan: &LoanDto, to: &str, message: Option<&str>) -> Result<(), ApiError> {
+/// `by` is who made the decision, shown on the request.
+fn set_status(conn: &mut Connection, loan: &LoanDto, to: &str, message: Option<&str>, by: &str) -> Result<(), ApiError> {
     if !transition_allowed(&loan.status, to) {
         return Err(ApiError::conflict(format!("Can't change a {} request to {to}", loan.status), None));
     }
     let tx = conn.transaction()?;
-    tx.execute("UPDATE loans SET status = ?1, updated_at = ?2 WHERE id = ?3", params![to, fmt_dt(now()), loan.id])?;
+    let by = if to == "pending" { "" } else { by };
+    tx.execute(
+        "UPDATE loans SET status = ?1, decided_by = ?2, updated_at = ?3 WHERE id = ?4",
+        params![to, by, fmt_dt(now()), loan.id],
+    )?;
     if to == "pending" {
         tx.execute("DELETE FROM loan_allocations WHERE loan_id = ?1", [loan.id])?;
     }
@@ -1236,14 +1196,16 @@ struct StatusIn {
     message: Option<String>,
 }
 
-async fn change_status(_: Admin, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<StatusIn>) -> ApiResult<Value> {
+async fn change_status(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<StatusIn>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     let mut conn = st.conn();
     let loan = get_loan(&conn, id)?;
-    set_status(&mut conn, &loan, &b.status, b.message.as_deref())?;
+    set_status(&mut conn, &loan, &b.status, b.message.as_deref(), &staff.display_name)?;
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn delete_loan(_: Admin, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+async fn delete_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
     st.conn().execute("DELETE FROM loans WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -1255,7 +1217,7 @@ struct CheckIn {
     items: Vec<ItemIn>,
 }
 
-async fn admin_check(_: Admin, State(st): State<AppState>, Json(b): Json<CheckIn>) -> ApiResult<Value> {
+async fn admin_check(_: Staff, State(st): State<AppState>, Json(b): Json<CheckIn>) -> ApiResult<Value> {
     let conn = st.conn();
     let v = validate_request_core(&conn, &b.pickup_at, &b.return_at, &b.items, false)?;
     let ev = evaluate_request(&conn, &v, None)?;
@@ -1332,7 +1294,7 @@ async fn public_cancel(State(st): State<AppState>, Path(token): Path<String>) ->
     if !matches!(loan.status.as_str(), "pending" | "approved") {
         return Err(ApiError::conflict("This request can no longer be cancelled online", None));
     }
-    set_status(&mut conn, &loan, "cancelled", None)?;
+    set_status(&mut conn, &loan, "cancelled", None, "Organiser")?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1340,9 +1302,7 @@ async fn public_cancel(State(st): State<AppState>, Path(token): Path<String>) ->
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
-        .route("/api/me", get(me))
+        .merge(auth::routes())
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{id}", put(update_room).delete(delete_room))
