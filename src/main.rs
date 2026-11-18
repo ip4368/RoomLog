@@ -3,6 +3,8 @@ mod db;
 mod demo;
 mod engine;
 mod recurrence;
+#[cfg(test)]
+mod tests;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, Uri, header};
