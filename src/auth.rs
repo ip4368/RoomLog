@@ -288,6 +288,7 @@ async fn me(staff: Staff, State(st): State<AppState>) -> ApiResult<Value> {
         "display_name": staff.display_name,
         "roles": staff.roles,
         "pending_loans": count("SELECT COUNT(*) FROM loans WHERE status = 'pending'")?,
+        "pending_bookings": count("SELECT COUNT(*) FROM bookings WHERE status = 'pending'")?,
     })))
 }
 

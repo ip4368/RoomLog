@@ -1,5 +1,7 @@
 mod api;
 mod auth;
+mod bookings;
+mod clash;
 mod db;
 mod demo;
 mod engine;

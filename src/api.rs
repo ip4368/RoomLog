@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::auth::{self, Role, Staff};
+use crate::bookings;
 use crate::db::{self, OccurrenceView, fmt_dt, parse_dt};
 use crate::engine::{self, Evaluation, Id};
 use crate::recurrence::{Recurrence, Span};
@@ -155,33 +156,70 @@ struct RoomDto {
     #[serde(default)]
     id: Id,
     name: String,
+    /// Private notes for staff.
     #[serde(default)]
     notes: String,
+    /// Shown on the public booking pages.
+    #[serde(default = "yes")]
+    bookable: bool,
+    capacity: Option<i64>,
+    #[serde(default)]
+    public_notes: String,
+}
+
+impl RoomDto {
+    fn validated(self, id: Id) -> Result<RoomDto, ApiError> {
+        if self.capacity.is_some_and(|c| !(1..=100_000).contains(&c)) {
+            return Err(ApiError::bad("Capacity must be a positive number"));
+        }
+        Ok(RoomDto {
+            id,
+            name: required(&self.name, "Name")?,
+            notes: clean(&self.notes, "Notes")?,
+            bookable: self.bookable,
+            capacity: self.capacity,
+            public_notes: clean(&self.public_notes, "Public description")?,
+        })
+    }
 }
 
 async fn list_rooms(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<RoomDto>> {
     let conn = st.conn();
-    let mut stmt = conn.prepare("SELECT id, name, notes FROM rooms ORDER BY name")?;
-    let rows = stmt.query_map([], |r| Ok(RoomDto { id: r.get(0)?, name: r.get(1)?, notes: r.get(2)? }))?;
+    let mut stmt = conn.prepare("SELECT id, name, notes, bookable, capacity, public_notes FROM rooms ORDER BY name")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RoomDto {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            notes: r.get(2)?,
+            bookable: r.get(3)?,
+            capacity: r.get(4)?,
+            public_notes: r.get(5)?,
+        })
+    })?;
     Ok(Json(rows.collect::<Result<_, _>>()?))
 }
 
 async fn create_room(_: Staff, State(st): State<AppState>, Json(b): Json<RoomDto>) -> ApiResult<RoomDto> {
     let conn = st.conn();
-    let name = required(&b.name, "Name")?;
-    let notes = clean(&b.notes, "Notes")?;
-    conn.execute("INSERT INTO rooms(name, notes) VALUES (?1, ?2)", params![name, notes])?;
-    Ok(Json(RoomDto { id: conn.last_insert_rowid(), name, notes }))
+    let r = b.validated(0)?;
+    conn.execute(
+        "INSERT INTO rooms(name, notes, bookable, capacity, public_notes) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![r.name, r.notes, r.bookable, r.capacity, r.public_notes],
+    )?;
+    Ok(Json(RoomDto { id: conn.last_insert_rowid(), ..r }))
 }
 
 async fn update_room(_: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<RoomDto>) -> ApiResult<RoomDto> {
     let conn = st.conn();
-    let name = required(&b.name, "Name")?;
-    let notes = clean(&b.notes, "Notes")?;
-    if conn.execute("UPDATE rooms SET name = ?1, notes = ?2 WHERE id = ?3", params![name, notes, id])? == 0 {
+    let r = b.validated(id)?;
+    if conn.execute(
+        "UPDATE rooms SET name = ?1, notes = ?2, bookable = ?3, capacity = ?4, public_notes = ?5 WHERE id = ?6",
+        params![r.name, r.notes, r.bookable, r.capacity, r.public_notes, id],
+    )? == 0
+    {
         return Err(ApiError::not_found());
     }
-    Ok(Json(RoomDto { id, name, notes }))
+    Ok(Json(r))
 }
 
 async fn delete_room(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
@@ -194,6 +232,13 @@ async fn delete_room(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
     )?;
     if active > 0 {
         return Err(ApiError::conflict("This room has equipment on active loans; finish those first", None));
+    }
+    let booked: i64 =
+        conn.query_row("SELECT COUNT(*) FROM bookings WHERE room_id = ?1 AND status IN ('pending','approved')", [id], |r| {
+            r.get(0)
+        })?;
+    if booked > 0 {
+        return Err(ApiError::conflict("This room has open bookings; decline or cancel them first", None));
     }
     conn.execute("DELETE FROM rooms WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
@@ -431,6 +476,9 @@ struct EventDto {
     needs: Vec<NeedDto>,
     #[serde(default)]
     description: String,
+    /// Set (output only) when the event came from an approved room booking.
+    #[serde(default)]
+    booking_id: Option<Id>,
 }
 
 fn one() -> i64 {
@@ -458,11 +506,18 @@ fn event_to_dto(e: &db::EventRow) -> EventDto {
         notes: e.notes.clone(),
         needs: e.needs.iter().map(|(&type_id, &quantity)| NeedDto { type_id, quantity }).collect(),
         description: e.rule.describe(),
+        booking_id: None,
     }
 }
 
 async fn list_events(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<EventDto>> {
-    Ok(Json(db::load_events(&st.conn())?.iter().map(event_to_dto).collect()))
+    let conn = st.conn();
+    let booked = db::booked_events(&conn)?;
+    let events = db::load_events(&conn)?
+        .iter()
+        .map(|e| EventDto { booking_id: booked.get(&e.id).map(|b| b.0), ..event_to_dto(e) })
+        .collect();
+    Ok(Json(events))
 }
 
 fn validate_event(b: &EventDto) -> Result<(), ApiError> {
@@ -546,38 +601,50 @@ fn save_event(conn: &mut Connection, id: Option<Id>, b: &EventDto) -> Result<Id,
     Ok(id)
 }
 
+// Saving an event never fails because of a room clash (overlapping church
+// events may be intended), but the response lists clashes so staff notice.
 async fn create_event(_: Staff, State(st): State<AppState>, Json(b): Json<EventDto>) -> ApiResult<Value> {
-    let id = save_event(&mut st.conn(), None, &b)?;
-    Ok(Json(json!({ "id": id })))
+    let mut conn = st.conn();
+    let id = save_event(&mut conn, None, &b)?;
+    Ok(Json(json!({ "id": id, "clashes": bookings::event_clashes(&conn, id)? })))
 }
 
 async fn update_event(_: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<EventDto>) -> ApiResult<Value> {
-    save_event(&mut st.conn(), Some(id), &b)?;
-    Ok(Json(json!({ "id": id })))
+    let mut conn = st.conn();
+    save_event(&mut conn, Some(id), &b)?;
+    Ok(Json(json!({ "id": id, "clashes": bookings::event_clashes(&conn, id)? })))
 }
 
 async fn delete_event(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
-    st.conn().execute("DELETE FROM events WHERE id = ?1", [id])?;
+    let conn = st.conn();
+    if let Some(booking) = bookings::booking_for_event(&conn, id)? {
+        return Err(ApiError::conflict(
+            format!("This event comes from room booking #{booking}. Cancel the booking instead."),
+            Some(json!({ "booking_id": booking })),
+        ));
+    }
+    conn.execute("DELETE FROM events WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
 }
 
 // -------------------------------------------------------- refs (name maps)
 
 #[derive(Serialize)]
-struct TypeRef {
-    name: String,
+pub struct TypeRef {
+    pub name: String,
     category: String,
 }
 
+/// id -> display name lookups sent alongside API responses.
 #[derive(Serialize)]
-struct Refs {
-    rooms: BTreeMap<Id, String>,
-    types: BTreeMap<Id, TypeRef>,
+pub struct Refs {
+    pub rooms: BTreeMap<Id, String>,
+    pub types: BTreeMap<Id, TypeRef>,
     groups: BTreeMap<Id, GroupDto>,
     events: BTreeMap<Id, String>,
 }
 
-fn load_refs(conn: &Connection) -> rusqlite::Result<Refs> {
+pub fn load_refs(conn: &Connection) -> rusqlite::Result<Refs> {
     let mut rooms = BTreeMap::new();
     let mut stmt = conn.prepare("SELECT id, name FROM rooms")?;
     for r in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?)))? {
@@ -620,7 +687,8 @@ async fn schedule(_: Staff, State(st): State<AppState>, Query(q): Query<Schedule
     let conn = st.conn();
     let occ: Vec<OccurrenceView> = db::expand_occurrences(&conn, &window)?;
     let loans = loans_overlapping(&conn, &window)?;
-    Ok(Json(json!({ "occurrences": occ, "loans": loans, "refs": load_refs(&conn)? })))
+    let booked: BTreeMap<Id, Id> = db::booked_events(&conn)?.into_iter().map(|(e, (b, _))| (e, b)).collect();
+    Ok(Json(json!({ "occurrences": occ, "loans": loans, "booked_events": booked, "refs": load_refs(&conn)? })))
 }
 
 #[derive(Deserialize)]
@@ -1303,6 +1371,7 @@ async fn public_cancel(State(st): State<AppState>, Path(token): Path<String>) ->
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(auth::routes())
+        .merge(bookings::routes())
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{id}", put(update_room).delete(delete_room))

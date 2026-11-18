@@ -434,3 +434,227 @@ fn migrations_upgrade_a_pre_accounts_database() {
     db::open(path.to_str().unwrap()).unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+fn at(d: NaiveDate, hm: &str) -> String {
+    format!("{}T{hm}", d.format("%Y-%m-%d"))
+}
+
+#[tokio::test]
+async fn room_booking_workflow() {
+    let mut admin = Client::new();
+    admin.login_admin().await;
+    let hall = admin.ok("POST", "/api/rooms", Some(json!({"name": "Main Hall", "capacity": 200}))).await["id"].as_i64().unwrap();
+    let store = admin.ok("POST", "/api/rooms", Some(json!({"name": "AV Store", "bookable": false}))).await["id"].as_i64().unwrap();
+    let mic = admin.ok("POST", "/api/equipment", Some(json!({"name": "SM58", "category": "Mics"}))).await["id"].as_i64().unwrap();
+    admin.ok("PUT", "/api/stock", Some(json!({"room_id": hall, "type_id": mic, "quantity": 4}))).await;
+    for (u, n, r) in [("office", "Olive Office", "bookings"), ("sound", "Sam Sound", "av")] {
+        admin
+            .ok("POST", "/api/users", Some(json!({"username": u, "display_name": n, "roles": [r], "password": "password1"})))
+            .await;
+    }
+    let mut office = admin.same_system();
+    office.login("office", "password1").await;
+    let mut av = admin.same_system();
+    av.login("sound", "password1").await;
+    let mut public = admin.same_system();
+
+    let sunday = next_sunday();
+    let tuesday = sunday + Duration::days(2);
+    let saturday = sunday + Duration::days(6);
+    admin
+        .ok(
+            "POST",
+            "/api/events",
+            Some(json!({"title": "Sunday Service", "room_id": hall, "group_id": null, "start_date": sunday.to_string(),
+                        "start_time": "09:00", "duration_minutes": 180, "recurrence": "weekly",
+                        "needs": [{"type_id": mic, "quantity": 2}]})),
+        )
+        .await;
+
+    // Only bookable rooms are offered, with the equipment that lives there.
+    let rooms = public.ok("GET", "/api/public/rooms", None).await;
+    assert_eq!(rooms.as_array().unwrap().len(), 1);
+    assert_eq!(rooms[0]["equipment"][0]["quantity"], 4);
+
+    // Exact time boundaries: overlapping clashes, back-to-back doesn't.
+    let slot = |start: String, end: String| json!({"room_id": hall, "start_at": start, "end_at": end});
+    let check = public.ok("POST", "/api/public/bookings/check", Some(slot(at(sunday, "11:00"), at(sunday, "13:00")))).await;
+    assert_eq!(check["clashes"][0]["with"][0]["title"], "Sunday Service", "church events are shown by name");
+    let check = public.ok("POST", "/api/public/bookings/check", Some(slot(at(sunday, "12:00"), at(sunday, "14:00")))).await;
+    assert_eq!(check["clashes"].as_array().unwrap().len(), 0);
+
+    let request = |room: i64, title: &str, start: String, end: String, extra: Value| {
+        let mut b = json!({"room_id": room, "title": title, "organiser_name": "Casey", "organisation": "Community Choir",
+                           "email": "choir@example.org", "start_at": start, "end_at": end});
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        b
+    };
+    let (s, _) = public
+        .call("POST", "/api/public/bookings", Some(request(store, "X", at(tuesday, "19:00"), at(tuesday, "21:00"), json!({}))))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "store room isn't bookable");
+    let (s, _) = public
+        .call(
+            "POST",
+            "/api/public/bookings",
+            Some(request(hall, "X", at(tuesday, "19:00"), at(tuesday, "21:00"), json!({"recurrence": "weekly"}))),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "repeating bookings need an end date");
+    let (s, v) = public
+        .call(
+            "POST",
+            "/api/public/bookings",
+            Some(request(hall, "X", at(tuesday, "19:00"), at(tuesday, "21:00"), json!({"needs": [{"type_id": mic, "quantity": 5}]}))),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["error"].as_str().unwrap().contains("only has 4"), "{v}");
+
+    // A weekly choir rehearsal for four Tuesdays, using two mics.
+    let choir = public
+        .ok(
+            "POST",
+            "/api/public/bookings",
+            Some(request(
+                hall,
+                "Choir rehearsal",
+                at(tuesday, "19:00"),
+                at(tuesday, "21:00"),
+                json!({"recurrence": "weekly", "until": (tuesday + Duration::days(21)).to_string(),
+                       "needs": [{"type_id": mic, "quantity": 2}], "av_support": true}),
+            )),
+        )
+        .await;
+    assert_eq!(choir["check"]["dates"], 4);
+    let choir_token = choir["token"].as_str().unwrap().to_string();
+    // A competing request for the first Tuesday evening.
+    public
+        .ok("POST", "/api/public/bookings", Some(request(hall, "Quiz night", at(tuesday, "20:00"), at(tuesday, "22:00"), json!({}))))
+        .await;
+    let me = office.ok("GET", "/api/me", None).await;
+    assert_eq!(me["pending_bookings"], 2);
+
+    let list = office.ok("GET", "/api/bookings?status=pending", None).await;
+    let id_of = |title: &str| list.as_array().unwrap().iter().find(|b| b["title"] == title).unwrap()["id"].as_i64().unwrap();
+    let (choir_id, quiz_id) = (id_of("Choir rehearsal"), id_of("Quiz night"));
+    let detail = office.ok("GET", &format!("/api/bookings/{choir_id}"), None).await;
+    assert_eq!(detail["clashes"].as_array().unwrap().len(), 0);
+    assert_eq!(detail["competing_pending"][0]["id"], quiz_id);
+
+    // Only staff with the bookings role can decide.
+    let (s, _) = av.call("POST", &format!("/api/bookings/{choir_id}/approve"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let approved = office
+        .ok("POST", &format!("/api/bookings/{choir_id}/approve"), Some(json!({"create_group": true, "message": "See you then"})))
+        .await;
+    let choir_event = approved["event_id"].as_i64().unwrap();
+    let detail = office.ok("GET", &format!("/api/bookings/{choir_id}"), None).await;
+    assert_eq!(detail["booking"]["status"], "approved");
+    assert_eq!(detail["booking"]["decided_by"], "Olive Office");
+    let groups = office.ok("GET", "/api/groups", None).await;
+    assert!(groups.as_array().unwrap().iter().any(|g| g["name"] == "Community Choir" && g["contact_email"] == "choir@example.org"));
+
+    // The approved booking now occupies the room: the competing request clashes.
+    let (s, v) = office.call("POST", &format!("/api/bookings/{quiz_id}/approve"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["detail"]["clashes"][0]["with"][0]["event_id"], choir_event);
+    let (s, _) = office.call("POST", &format!("/api/bookings/{quiz_id}/approve"), Some(json!({"skip_clashing": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "every date clashes");
+    office
+        .ok("POST", &format!("/api/bookings/{quiz_id}/status"), Some(json!({"status": "declined", "message": "Sorry, the hall is taken"})))
+        .await;
+
+    // The public calendar hides external booking names unless the organiser opted in.
+    let avail = public.ok("GET", &format!("/api/public/availability?from={sunday}&days=7"), None).await;
+    let titles: Vec<&str> = avail["busy"].as_array().unwrap().iter().map(|b| b["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"Sunday Service"));
+    assert!(titles.contains(&"Booked"));
+    assert!(!titles.contains(&"Choir rehearsal"));
+    let choir_slot = format!("{}:00", at(tuesday, "19:00"));
+    assert!(avail["busy"].as_array().unwrap().iter().any(|b| b["start"] == choir_slot.as_str()), "{avail}");
+
+    // The booking's equipment is protected from loans like any church event's.
+    let check = public
+        .ok(
+            "POST",
+            "/api/public/check",
+            Some(json!({"pickup_at": at(tuesday, "18:00"), "return_at": at(tuesday, "21:30"),
+                        "items": [{"type_id": mic, "quantity": 4}]})),
+        )
+        .await;
+    assert_eq!(check["items"][0]["available"], 2);
+
+    // A booked event can't be deleted out from under its booking.
+    let (s, _) = admin.call("DELETE", &format!("/api/events/{choir_event}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let sched = admin.ok("GET", &format!("/api/schedule?from={tuesday}&days=1"), None).await;
+    assert_eq!(sched["booked_events"][choir_event.to_string()], choir_id);
+
+    // Partly clashing repeat: approve and skip only the clashing date.
+    let week3 = tuesday + Duration::days(21);
+    office
+        .ok(
+            "POST",
+            "/api/bookings",
+            Some(request(hall, "Youth band", at(week3, "20:00"), at(week3, "21:30"),
+                         json!({"recurrence": "weekly", "until": (week3 + Duration::days(14)).to_string()}))),
+        )
+        .await;
+    let band_id = office.ok("GET", "/api/bookings?status=pending", None).await[0]["id"].as_i64().unwrap();
+    let (s, v) = office.call("POST", &format!("/api/bookings/{band_id}/approve"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(v["error"].as_str().unwrap().starts_with("1 of 3 dates"), "{v}");
+    let r = office.ok("POST", &format!("/api/bookings/{band_id}/approve"), Some(json!({"skip_clashing": true}))).await;
+    assert_eq!(r["skipped_dates"], 1);
+    let detail = office.ok("GET", &format!("/api/bookings/{band_id}"), None).await;
+    assert_eq!(detail["cancelled_dates"].as_array().unwrap().len(), 1);
+
+    // Editing a church event warns about room clashes but still saves.
+    let saved = admin
+        .ok(
+            "POST",
+            "/api/events",
+            Some(json!({"title": "Prayer meeting", "room_id": hall, "group_id": null, "start_date": tuesday.to_string(),
+                        "start_time": "20:30", "duration_minutes": 60, "recurrence": "none"})),
+        )
+        .await;
+    assert_eq!(saved["clashes"][0]["with"][0]["event_id"], choir_event);
+
+    // The organiser sees the decision and can cancel, which frees the room.
+    let status = public.ok("GET", &format!("/api/public/bookings/{choir_token}"), None).await;
+    assert_eq!(status["status"], "approved");
+    assert_eq!(status["message"], "See you then");
+    assert_eq!(status["room"], "Main Hall");
+    public.ok("POST", &format!("/api/public/bookings/{choir_token}/cancel"), None).await;
+    let avail = public.ok("GET", &format!("/api/public/availability?from={tuesday}&days=1"), None).await;
+    assert!(avail["busy"].as_array().unwrap().iter().all(|b| b["start"] != choir_slot.as_str()), "{avail}");
+    let events = admin.ok("GET", "/api/events", None).await;
+    assert!(events.as_array().unwrap().iter().all(|e| e["id"] != choir_event), "cancelling removes the event");
+
+    // Equipment impact: a pending booking that would leave an approved loan short.
+    let loan = av
+        .ok(
+            "POST",
+            "/api/loans",
+            Some(json!({"organiser_name": "Pat", "pickup_at": at(saturday, "08:00"), "return_at": at(saturday, "12:00"),
+                        "items": [{"type_id": mic, "quantity": 2}]})),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    av.ok("POST", &format!("/api/loans/{loan}/approve"), Some(json!({}))).await;
+    office
+        .ok(
+            "POST",
+            "/api/bookings",
+            Some(request(hall, "Wedding", at(saturday, "10:00"), at(saturday, "16:00"),
+                         json!({"needs": [{"type_id": mic, "quantity": 4}]}))),
+        )
+        .await;
+    let pending = office.ok("GET", "/api/bookings?status=pending", None).await;
+    let wedding = pending.as_array().unwrap().iter().find(|b| b["title"] == "Wedding").unwrap()["id"].as_i64().unwrap();
+    let detail = office.ok("GET", &format!("/api/bookings/{wedding}"), None).await;
+    assert_eq!(detail["equipment_impact"][0]["loan_id"], loan);
+    assert_eq!(detail["equipment_impact"][0]["short_by"], 2);
+}

@@ -145,6 +145,51 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE loans ADD COLUMN decided_by TEXT NOT NULL DEFAULT '';
     "#,
+    // 2: room booking. An approved booking is materialised as an `events` row
+    // (bookings.event_id), so it occupies the room and protects its equipment
+    // exactly like any other church event.
+    r#"
+    ALTER TABLE rooms ADD COLUMN bookable INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE rooms ADD COLUMN capacity INTEGER;
+    ALTER TABLE rooms ADD COLUMN public_notes TEXT NOT NULL DEFAULT '';
+    CREATE TABLE bookings (
+        id                   INTEGER PRIMARY KEY,
+        token                TEXT NOT NULL UNIQUE,
+        status               TEXT NOT NULL,
+        room_id              INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        title                TEXT NOT NULL,
+        organiser_name       TEXT NOT NULL,
+        organisation         TEXT NOT NULL DEFAULT '',
+        email                TEXT NOT NULL DEFAULT '',
+        phone                TEXT NOT NULL DEFAULT '',
+        attendees            INTEGER,
+        start_date           TEXT NOT NULL,
+        start_time           TEXT NOT NULL,
+        duration_minutes     INTEGER NOT NULL CHECK (duration_minutes > 0),
+        recurrence           TEXT NOT NULL CHECK (recurrence IN ('none','weekly','monthly')),
+        interval_weeks       INTEGER NOT NULL DEFAULT 1,
+        nth                  INTEGER NOT NULL DEFAULT 1,
+        until                TEXT,
+        av_support           INTEGER NOT NULL DEFAULT 0,
+        public_title         INTEGER NOT NULL DEFAULT 0,
+        notes                TEXT NOT NULL DEFAULT '',
+        admin_notes          TEXT NOT NULL DEFAULT '',
+        message_to_organiser TEXT NOT NULL DEFAULT '',
+        event_id             INTEGER REFERENCES events(id) ON DELETE SET NULL,
+        decided_by           TEXT NOT NULL DEFAULT '',
+        decided_at           TEXT,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL
+    );
+    CREATE INDEX idx_bookings_room_status ON bookings(room_id, status);
+    CREATE INDEX idx_bookings_event ON bookings(event_id);
+    CREATE TABLE booking_needs (
+        booking_id INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+        type_id    INTEGER NOT NULL REFERENCES equipment_types(id) ON DELETE CASCADE,
+        quantity   INTEGER NOT NULL CHECK (quantity > 0),
+        PRIMARY KEY (booking_id, type_id)
+    );
+    "#,
 ];
 
 pub fn open(path: &str) -> rusqlite::Result<Connection> {
@@ -350,6 +395,36 @@ pub fn expand_occurrences(conn: &Connection, window: &Span) -> rusqlite::Result<
     }
     out.sort_by(|a, b| a.start.cmp(&b.start).then(a.title.cmp(&b.title)));
     Ok(out)
+}
+
+/// Non-cancelled occurrences in `room_id` overlapping `window`, optionally
+/// ignoring one event (e.g. the booking's own).
+pub fn room_occupancy(
+    conn: &Connection,
+    room_id: Id,
+    window: &Span,
+    exclude_event: Option<Id>,
+) -> rusqlite::Result<Vec<OccurrenceView>> {
+    Ok(expand_occurrences(conn, window)?
+        .into_iter()
+        .filter(|o| o.room_id == room_id && !o.cancelled && Some(o.event_id) != exclude_event)
+        .collect())
+}
+
+/// event_id -> (booking_id, show the booking's title publicly) for events
+/// that came from an approved room booking.
+pub fn booked_events(conn: &Connection) -> rusqlite::Result<HashMap<Id, (Id, bool)>> {
+    let mut stmt = conn.prepare("SELECT event_id, id, public_title FROM bookings WHERE event_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, (r.get::<_, Id>(1)?, r.get::<_, bool>(2)?))))?;
+    rows.collect()
+}
+
+pub fn recurrence_to_db(r: Recurrence) -> (&'static str, i64, i64) {
+    match r {
+        Recurrence::None => ("none", 1, 1),
+        Recurrence::Weekly { interval } => ("weekly", i64::from(interval), 1),
+        Recurrence::Monthly { nth } => ("monthly", 1, i64::from(nth)),
+    }
 }
 
 // ------------------------------------------------------------------- loans
