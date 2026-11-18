@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod demo;
 mod engine;
 mod recurrence;
 
@@ -63,6 +64,19 @@ async fn main() {
         eprintln!("Failed to open database {db_path}: {e}");
         std::process::exit(1);
     });
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("seed-demo") {
+        match demo::seed(&conn) {
+            Ok(true) => println!("Demo data loaded into {db_path}"),
+            Ok(false) => println!("{db_path} already has rooms; demo data not loaded"),
+            Err(e) => {
+                eprintln!("Failed to seed demo data: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let password = match std::env::var("ADMIN_PASSWORD") {
         Ok(p) if p.len() >= 8 => p,
