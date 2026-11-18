@@ -307,7 +307,9 @@ fn demo_seed_loads() {
     assert!(crate::demo::seed(&conn).unwrap());
     assert!(!crate::demo::seed(&conn).unwrap());
     let events = db::load_events(&conn).unwrap();
-    assert_eq!(events.len(), 6);
+    assert_eq!(events.len(), 7, "six church events plus one approved booking");
+    let bookings: i64 = conn.query_row("SELECT COUNT(*) FROM bookings", [], |r| r.get(0)).unwrap();
+    assert_eq!(bookings, 2);
 }
 
 #[tokio::test]

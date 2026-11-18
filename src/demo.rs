@@ -1,5 +1,6 @@
 //! Sample data so the system can be tried out straight away (`roomlog seed-demo`).
 
+use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use rusqlite::{Connection, params};
 
 pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
@@ -9,9 +10,18 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
     }
     let tx = conn.unchecked_transaction()?;
 
-    let rooms = ["Main Hall", "Youth Room", "Chapel", "AV Store"];
-    for r in rooms {
-        tx.execute("INSERT INTO rooms(name) VALUES (?1)", [r])?;
+    // (name, bookable, capacity, public description)
+    let rooms = [
+        ("Main Hall", true, Some(250), "Stage, ceiling projector and PA. Kitchen next door."),
+        ("Youth Room", true, Some(60), "Couches, projector and games. Ground floor, step-free."),
+        ("Chapel", true, Some(80), "Quiet space with piano and a small PA."),
+        ("AV Store", false, None, ""),
+    ];
+    for (name, bookable, capacity, public_notes) in rooms {
+        tx.execute(
+            "INSERT INTO rooms(name, bookable, capacity, public_notes) VALUES (?1, ?2, ?3, ?4)",
+            params![name, bookable, capacity, public_notes],
+        )?;
     }
     let types = [
         ("Shure SM58 vocal mic", "Microphones", true),
@@ -163,6 +173,74 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             )?;
         }
     }
+
+    // Room bookings, relative to today so they show up as upcoming.
+    let next = |wd: Weekday| -> NaiveDate {
+        let mut d = Local::now().date_naive() + Duration::days(1);
+        while d.weekday() != wd {
+            d += Duration::days(1);
+        }
+        d
+    };
+    let ts = crate::db::fmt_dt(Local::now().naive_local());
+    let tuesday = next(Weekday::Tue);
+    let saturday = next(Weekday::Sat);
+    // Approved: a community choir rehearsing in the Chapel every Tuesday for ten weeks.
+    tx.execute(
+        "INSERT INTO groups(name, contact_name, contact_phone, contact_email, notes)
+         VALUES ('Harbour Community Choir', 'Casey Nguyen', '0400 000 006', 'choir@example.org', 'Created from room booking #1')",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO events(title, room_id, group_id, start_date, start_time, duration_minutes, recurrence, interval_weeks, nth, until, notes)
+         VALUES ('Choir rehearsal', ?1, ?2, ?3, '19:00', 120, 'weekly', 1, 1, ?4, 'Room booking #1')",
+        params![
+            id("rooms", "Chapel")?,
+            id("groups", "Harbour Community Choir")?,
+            tuesday.to_string(),
+            (tuesday + Duration::weeks(9)).to_string()
+        ],
+    )?;
+    let choir_event = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO event_needs(event_id, type_id, quantity) VALUES (?1, ?2, 1)",
+        params![choir_event, id("equipment_types", "Wireless handheld mic")?],
+    )?;
+    tx.execute(
+        "INSERT INTO bookings(id, token, status, room_id, title, organiser_name, organisation, email, phone, attendees,
+             start_date, start_time, duration_minutes, recurrence, until, public_title, event_id, decided_by, decided_at,
+             message_to_organiser, created_at, updated_at)
+         VALUES (1, ?6, 'approved', ?1, 'Choir rehearsal', 'Casey Nguyen',
+             'Harbour Community Choir', 'choir@example.org', '0400 000 006', 30, ?2, '19:00', 120, 'weekly', ?3, 1, ?4,
+             'Administrator', ?5, 'Use the side door; the code is on your confirmation email.', ?5, ?5)",
+        params![
+            id("rooms", "Chapel")?,
+            tuesday.to_string(),
+            (tuesday + Duration::weeks(9)).to_string(),
+            choir_event,
+            ts,
+            crate::api::random_token(32)
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO booking_needs(booking_id, type_id, quantity) VALUES (1, ?1, 1)",
+        [id("equipment_types", "Wireless handheld mic")?],
+    )?;
+    // Pending: a birthday party in the Main Hall that wants the PA.
+    tx.execute(
+        "INSERT INTO bookings(id, token, status, room_id, title, organiser_name, email, attendees, start_date, start_time,
+             duration_minutes, recurrence, av_support, notes, created_at, updated_at)
+         VALUES (2, ?4, 'pending', ?1, '50th birthday party', 'Robin Patel',
+             'robin@example.org', 90, ?2, '17:00', 330, 'none', 1, 'Includes an hour to decorate and an hour to clean up.', ?3, ?3)",
+        params![id("rooms", "Main Hall")?, saturday.to_string(), ts, crate::api::random_token(32)],
+    )?;
+    for (t, q) in [("Wireless handheld mic", 2), ("Ceiling projector (installed)", 1)] {
+        tx.execute(
+            "INSERT INTO booking_needs(booking_id, type_id, quantity) VALUES (2, ?1, ?2)",
+            params![id("equipment_types", t)?, q],
+        )?;
+    }
+
     tx.commit()?;
     Ok(true)
 }

@@ -106,6 +106,14 @@ function isoDate(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 const statusBadge = (s) => h('span', { class: `badge ${s}` }, s);
+const sameDay = (a, b) => isoDate(toDate(a)) === isoDate(toDate(b));
+function fmtRange(start, end) {
+  const day = (d) => toDate(d).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+  return sameDay(start, end)
+    ? `${day(start)}, ${fmtTime(start)}–${fmtTime(end)}`
+    : `${day(start)} ${fmtTime(start)} → ${day(end)} ${fmtTime(end)}`;
+}
+const ORDINAL = { 1: '1st', 2: '2nd', 3: '3rd', 4: '4th', 5: '5th', '-1': 'last' };
 
 function field(labelText, input, { required = false, hint } = {}) {
   const id = input.id || 'f' + Math.random().toString(36).slice(2);
@@ -177,6 +185,7 @@ const needsRoleNote = (role) => h('p', { class: 'muted small' },
 
 // [href, label, role needed to see it (null = all staff), pending-count key]
 const ADMIN_NAV = [
+  ['/admin/bookings', 'Bookings', null, 'pending_bookings'],
   ['/admin/loans', 'Loans', null, 'pending_loans'],
   ['/admin/check', 'Quick check', null],
   ['/admin/schedule', 'Schedule', null],
@@ -202,7 +211,7 @@ function showNav(path) {
 }
 
 /** Where staff land after logging in. */
-const adminHome = () => '/admin/loans';
+const adminHome = () => (hasRole('av') && !hasRole('bookings') ? '/admin/loans' : '/admin/bookings');
 
 async function route() {
   const path = location.pathname.replace(/\/+$/, '') || '/';
@@ -214,10 +223,17 @@ async function route() {
     showNav(path);
     if (path === '/') return await pageHome();
     if (path === '/request') return await pageRequestForm();
+    if (path === '/rooms') return await pageAvailability();
+    if (path === '/book') return await pageBookRoom();
+    if ((r = m(/^\/booking\/([A-Za-z0-9]+)$/))) return await pageBookingStatus(r[1]);
     if ((r = m(/^\/status\/([A-Za-z0-9]+)$/))) return await pageStatus(r[1]);
     if (path === '/admin/login') return pageLogin();
     if (path === '/admin') return navigate(adminHome(), true);
     if (path === '/admin/loans') return await pageLoans();
+    if (path === '/admin/bookings') return await pageBookings();
+    if (path === '/admin/bookings/new') return await pageBookingEdit(null);
+    if ((r = m(/^\/admin\/bookings\/(\d+)\/edit$/))) return await pageBookingEdit(+r[1]);
+    if ((r = m(/^\/admin\/bookings\/(\d+)$/))) return await pageBooking(+r[1]);
     if ((r = m(/^\/admin\/loans\/(\d+)$/))) return await pageLoan(+r[1]);
     if (path === '/admin/check') return await pageCheck();
     if (path === '/admin/schedule') return await pageSchedule();
@@ -242,7 +258,7 @@ async function loadInfo() {
   try {
     const info = await GET('/api/public/info');
     churchName = info.church_name;
-    document.getElementById('brand-name').textContent = `${churchName} · AV`;
+    document.getElementById('brand-name').textContent = churchName;
   } catch (_) { /* offline */ }
 }
 
@@ -255,6 +271,15 @@ function myRequests() {
   return JSON.parse(saved || '[]');
 }
 
+/** Remember a request's private status link on this device. kind: 'loan' | 'booking'. */
+function rememberRequest(kind, token, label) {
+  const mine = myRequests();
+  mine.unshift({ kind, token, label });
+  localStorage.setItem(MY_REQUESTS_KEY, JSON.stringify(mine.slice(0, 20)));
+}
+
+const requestLink = (r) => (r.kind === 'booking' ? `/booking/${r.token}` : `/status/${r.token}`);
+
 async function pageHome() {
   let staff = false;
   try { await fetch('/api/me', { credentials: 'same-origin' }).then((r) => { staff = r.ok; }); } catch (_) {}
@@ -262,13 +287,15 @@ async function pageHome() {
   const mine = myRequests();
   render(
     h('div', { class: 'hero' },
-      h('h1', {}, `${churchName} AV equipment`),
-      h('p', { class: 'muted' }, 'Borrow sound and video equipment for your off-site event.'),
-      h('a', { class: 'btn primary', href: '/request', 'data-link': true }, 'Request equipment'),
-      h('a', { class: 'btn', href: '/admin/login', 'data-link': true }, 'Staff login')),
+      h('h1', {}, churchName),
+      h('p', { class: 'muted' }, 'Book a room at church, or borrow sound and video equipment for an event elsewhere.'),
+      h('a', { class: 'btn primary', href: '/book', 'data-link': true }, 'Book a room'),
+      h('a', { class: 'btn', href: '/rooms', 'data-link': true }, 'See room availability'),
+      h('a', { class: 'btn', href: '/request', 'data-link': true }, 'Borrow equipment'),
+      h('div', { style: 'margin-top:1rem' }, h('a', { class: 'small', href: '/admin/login', 'data-link': true }, 'Staff login'))),
     mine.length ? h('div', { class: 'card' },
       h('h2', {}, 'Your requests on this device'),
-      h('ul', {}, mine.map((r) => h('li', {}, h('a', { href: `/status/${r.token}`, 'data-link': true }, r.label))))) : null,
+      h('ul', {}, mine.map((r) => h('li', {}, h('a', { href: requestLink(r), 'data-link': true }, r.label))))) : null,
   );
 }
 
@@ -365,9 +392,7 @@ async function pageRequestForm() {
     const p = payload();
     if (!p.event_name.trim()) throw new Error('Event name is required');
     const res = await POST('/api/public/requests', p);
-    const mine = myRequests();
-    mine.unshift({ token: res.token, label: `${p.event_name} (${fmtDT(p.pickup_at)})` });
-    localStorage.setItem(MY_REQUESTS_KEY, JSON.stringify(mine.slice(0, 20)));
+    rememberRequest('loan', res.token, `Equipment: ${p.event_name} (${fmtDT(p.pickup_at)})`);
     const link = `${location.origin}/status/${res.token}`;
     render(
       h('h1', {}, 'Request sent'),
@@ -422,6 +447,273 @@ async function pageStatus(token) {
   );
 }
 
+
+// ------------------------------------------------------------ room booking
+
+/** Split busy blocks into per-day pieces (a booking can run past midnight). */
+function busyOnDay(busy, day) {
+  const dayStart = new Date(`${day}T00:00`);
+  const dayEnd = new Date(dayStart.getTime() + 86400000);
+  return busy
+    .map((b) => ({ ...b, s: toDate(b.start), e: toDate(b.end) }))
+    .filter((b) => b.s < dayEnd && b.e > dayStart)
+    .map((b) => ({ ...b, s: b.s < dayStart ? dayStart : b.s, e: b.e > dayEnd ? dayEnd : b.e, dayStart }))
+    .sort((a, b) => a.s - b.s);
+}
+
+function timeline(pieces) {
+  const pct = (d, start) => ((d - start) / 86400000) * 100;
+  return h('div', { class: 'timeline', 'aria-hidden': 'true' },
+    pieces.map((p) => h('span', { style: `left:${pct(p.s, p.dayStart)}%;width:${Math.max(0.6, pct(p.e, p.dayStart) - pct(p.s, p.dayStart))}%`, title: p.title })));
+}
+
+async function pageAvailability() {
+  const params = new URLSearchParams(location.search);
+  const from = params.get('from') || isoDate(new Date());
+  const roomFilter = params.get('room') || '';
+  const [rooms, avail] = await Promise.all([GET('/api/public/rooms'), GET(`/api/public/availability?from=${from}&days=7`)]);
+  const shift = (days) => isoDate(new Date(new Date(`${from}T00:00`).getTime() + days * 86400000));
+  const go = (f, r) => navigate(`/rooms?from=${f}${r ? `&room=${r}` : ''}`);
+  const fromIn = h('input', { type: 'date', value: from, onchange: () => go(fromIn.value, roomSel.value) });
+  const roomSel = h('select', { onchange: () => go(from, roomSel.value) }, h('option', { value: '' }, 'All rooms'),
+    rooms.map((r) => h('option', { value: r.id }, r.name)));
+  roomSel.value = roomFilter;
+  const shown = rooms.filter((r) => !roomFilter || String(r.id) === roomFilter);
+  const days = [...Array(7)].map((_, i) => shift(i));
+  render(
+    h('div', { class: 'row' }, h('h1', {}, 'Room availability'), h('span', { class: 'spacer' }),
+      h('a', { class: 'btn primary', href: '/book', 'data-link': true }, 'Book a room')),
+    h('p', { class: 'muted' }, 'Times shown are already taken. Requests waiting for a decision are not shown, so a free time could still be requested by someone else.'),
+    h('div', { class: 'card row' },
+      h('button', { class: 'small', onclick: () => go(shift(-7), roomFilter) }, '← Previous week'),
+      fromIn,
+      h('button', { class: 'small', onclick: () => go(shift(7), roomFilter) }, 'Next week →'),
+      h('span', { class: 'spacer' }), roomSel),
+    rooms.length === 0 ? h('p', { class: 'muted' }, 'No rooms are available to book online.') :
+      h('div', { class: 'card' }, days.map((day) => [
+        h('div', { class: 'day' }, fmtDate(`${day}T00:00`)),
+        shown.map((room) => {
+          const pieces = busyOnDay(avail.busy.filter((b) => b.room_id === room.id), day);
+          return h('div', { class: 'avail-row' },
+            h('div', { class: 'avail-room' }, room.name),
+            h('div', { class: 'avail-busy' },
+              timeline(pieces),
+              pieces.length ? pieces.map((p) => h('span', { class: 'pill busy' }, `${fmtTime(p.s)}–${p.e.getTime() === p.dayStart.getTime() + 86400000 ? '24:00' : fmtTime(p.e)} ${p.title}`))
+                : h('span', { class: 'muted small' }, 'Free all day')),
+            h('a', { class: 'btn small', href: `/book?room=${room.id}&date=${day}`, 'data-link': true }, 'Book'));
+        })])),
+  );
+}
+
+/** Options for the "Repeats" select, which depend on the first date. */
+function repeatOptions(dateStr) {
+  const opts = [['none', 'Just once'], ['weekly:1', 'Every week'], ['weekly:2', 'Every 2 weeks'], ['weekly:3', 'Every 3 weeks'], ['weekly:4', 'Every 4 weeks']];
+  if (dateStr) {
+    const d = new Date(`${dateStr}T00:00`);
+    const wd = d.toLocaleDateString(undefined, { weekday: 'long' });
+    const nth = Math.ceil(d.getDate() / 7);
+    const daysInMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    opts.push([`monthly:${nth}`, `Monthly on the ${ORDINAL[nth]} ${wd}`]);
+    if (d.getDate() + 7 > daysInMonth) opts.push(['monthly:-1', `Monthly on the last ${wd}`]);
+  }
+  return opts;
+}
+
+/**
+ * The booking form, shared by the public page and staff.
+ * rooms: from /api/public/rooms (with the equipment in each room).
+ */
+function bookingForm(rooms, initial = {}, { staff = false } = {}) {
+  const f = {
+    room: h('select', {}, rooms.map((r) => h('option', { value: r.id }, r.name + (r.capacity ? ` (up to ${r.capacity} people)` : '')))),
+    title: h('input', { value: initial.title || '' }),
+    start: h('input', { type: 'datetime-local', value: initial.start_at ? initial.start_at.slice(0, 16) : '' }),
+    end: h('input', { type: 'datetime-local', value: initial.end_at ? initial.end_at.slice(0, 16) : '' }),
+    repeat: h('select'),
+    until: h('input', { type: 'date', value: initial.until || '' }),
+    attendees: h('input', { type: 'number', min: 1, value: initial.attendees ?? '' }),
+    av_support: h('input', { type: 'checkbox', checked: initial.av_support }),
+    public_title: h('input', { type: 'checkbox', checked: initial.public_title }),
+    notes: h('textarea', { placeholder: 'Anything else? e.g. tables and chairs, kitchen use, access before the start time' }),
+    organiser_name: h('input', { autocomplete: 'name', value: initial.organiser_name || '' }),
+    organisation: h('input', { autocomplete: 'organization', value: initial.organisation || '' }),
+    email: h('input', { type: 'email', autocomplete: 'email', value: initial.email || '' }),
+    phone: h('input', { type: 'tel', autocomplete: 'tel', value: initial.phone || '' }),
+  };
+  f.notes.value = initial.notes || '';
+  if (initial.room_id) {
+    if (!rooms.some((r) => r.id === initial.room_id)) f.room.append(h('option', { value: initial.room_id }, `Room #${initial.room_id}`));
+    f.room.value = initial.room_id;
+  }
+  const initialRepeat = initial.recurrence === 'weekly' ? `weekly:${initial.interval_weeks}`
+    : initial.recurrence === 'monthly' ? `monthly:${initial.nth}` : 'none';
+  const roomInfo = h('div', { class: 'muted small' });
+  const equipment = h('div');
+  const needQty = new Map((initial.needs || []).map((n) => [n.type_id, n.quantity]));
+  const repeatFields = h('div');
+
+  const refreshRoom = () => {
+    const room = rooms.find((r) => String(r.id) === f.room.value);
+    roomInfo.textContent = room ? room.public_notes : '';
+    equipment.replaceChildren(!room || !room.equipment.length
+      ? h('p', { class: 'muted small' }, 'No equipment is listed for this room.')
+      : h('div', {}, room.equipment.map((e) => {
+        const qty = h('input', { type: 'number', min: 0, max: e.quantity, value: needQty.get(e.type_id) || 0, 'aria-label': e.name, 'data-type': e.type_id });
+        qty.addEventListener('change', () => needQty.set(e.type_id, +qty.value || 0));
+        return h('div', { class: 'item-row' }, qty, h('span', {}, e.name, h('span', { class: 'muted small' }, ` (${e.quantity} in room)`)));
+      })));
+  };
+  const refreshRepeat = (keep) => {
+    const current = keep ?? f.repeat.value;
+    f.repeat.replaceChildren(...repeatOptions(f.start.value.slice(0, 10)).map(([v, l]) => h('option', { value: v }, l)));
+    f.repeat.value = [...f.repeat.options].some((o) => o.value === current) ? current : 'none';
+    repeatFields.replaceChildren(...(f.repeat.value === 'none' ? []
+      : [field('Last date', f.until, { required: true, hint: 'Repeating bookings can run for up to a year.' })]));
+  };
+  f.room.addEventListener('change', refreshRoom);
+  f.repeat.addEventListener('change', () => refreshRepeat());
+  f.start.addEventListener('change', () => {
+    // Suggest a two-hour slot when the end is missing or before the start.
+    if (f.start.value && (!f.end.value || f.end.value <= f.start.value)) {
+      f.end.value = localInput(new Date(new Date(f.start.value).getTime() + 2 * 3600000));
+    }
+    refreshRepeat();
+  });
+  refreshRoom();
+  refreshRepeat(initialRepeat);
+
+  const payload = () => {
+    const [kind, n] = f.repeat.value.split(':');
+    return {
+      room_id: +f.room.value, title: f.title.value, start_at: f.start.value, end_at: f.end.value,
+      recurrence: kind, interval_weeks: kind === 'weekly' ? +n : 1, nth: kind === 'monthly' ? +n : 1,
+      until: kind === 'none' ? null : f.until.value || null,
+      attendees: f.attendees.value ? +f.attendees.value : null,
+      needs: [...equipment.querySelectorAll('input[data-type]')].map((i) => ({ type_id: +i.dataset.type, quantity: +i.value || 0 })).filter((n) => n.quantity > 0),
+      av_support: f.av_support.checked, public_title: f.public_title.checked, notes: f.notes.value,
+      organiser_name: f.organiser_name.value, organisation: f.organisation.value, email: f.email.value, phone: f.phone.value,
+    };
+  };
+
+  const result = h('div');
+  const checkBtn = h('button', { type: 'button' }, 'Check availability');
+  checkBtn.addEventListener('click', busy(checkBtn, async () => {
+    const check = await POST('/api/public/bookings/check', payload());
+    result.replaceChildren(bookingCheckView(check));
+  }));
+
+  const el = h('div', {},
+    h('div', { class: 'card' },
+      h('h2', {}, 'When and where'),
+      h('div', { class: 'grid' }, field('Room', f.room, { required: true }), field('Event name', f.title, { required: true })),
+      roomInfo,
+      h('div', { class: 'grid', style: 'margin-top:0.7rem' },
+        field('From', f.start, { required: true, hint: 'Include time to set up' }),
+        field('Until', f.end, { required: true, hint: 'Include time to pack down' }),
+        field('Repeats', f.repeat)),
+      repeatFields,
+      h('div', { class: 'grid' }, field('Expected number of people', f.attendees)),
+      result,
+      checkBtn),
+    h('div', { class: 'card' },
+      h('h2', {}, 'Equipment in the room'),
+      h('p', { class: 'muted small' }, 'Say what you would like to use, so the AV team keeps it in the room for you.'),
+      equipment,
+      h('label', { class: 'check', style: 'margin-top:0.6rem' }, f.av_support, 'We would like someone from the AV team to help'),
+      field('Notes', f.notes)),
+    h('div', { class: 'card' },
+      h('h2', {}, staff ? 'Organiser' : 'About you'),
+      h('div', { class: 'grid' },
+        field(staff ? 'Organiser name' : 'Your name', f.organiser_name, { required: true }),
+        field('Organisation / group', f.organisation),
+        field('Email', f.email, { hint: staff ? null : 'Email or phone required' }),
+        field('Phone', f.phone)),
+      h('label', { class: 'check' }, f.public_title, 'Show the event name on the public calendar (otherwise it shows as "Booked")')));
+  return { el, payload, result };
+}
+
+function bookingCheckView(check) {
+  if (!check.clashes.length) {
+    return h('div', { class: 'banner ok' },
+      check.dates > 1 ? `The room is free on all ${check.dates} dates.` : 'The room is free at that time.',
+      h('p', {}, 'Your booking still needs to be approved by the church office.'));
+  }
+  return h('div', { class: 'banner warn' },
+    check.dates > 1 ? `${check.clashes.length} of ${check.dates} dates clash with something already booked:` : 'The room is already booked at that time:',
+    h('ul', {}, check.clashes.slice(0, 12).map((c) => h('li', {}, fmtRange(c.start, c.end), ': ',
+      c.with.map((w) => `${w.title} (${fmtTime(w.start)}–${fmtTime(w.end)})`).join(', ')))),
+    check.clashes.length > 12 ? h('p', {}, `…and ${check.clashes.length - 12} more.`) : null,
+    h('p', {}, 'Try a different time or room. For repeating bookings you can still send the request, and the office can approve just the free dates.'));
+}
+
+async function pageBookRoom() {
+  const rooms = await GET('/api/public/rooms');
+  if (!rooms.length) return render(h('h1', {}, 'Book a room'), h('p', { class: 'muted' }, 'No rooms are available to book online at the moment.'));
+  const params = new URLSearchParams(location.search);
+  const initial = {};
+  if (params.get('room')) initial.room_id = +params.get('room');
+  if (params.get('date')) {
+    initial.start_at = `${params.get('date')}T10:00`;
+    initial.end_at = `${params.get('date')}T12:00`;
+  }
+  const form = bookingForm(rooms, initial);
+  const submit = h('button', { type: 'submit', class: 'primary' }, 'Send booking request');
+  const wrap = h('form', {}, form.el, h('div', { class: 'row' }, submit));
+  wrap.addEventListener('submit', busy(submit, async () => {
+    const p = form.payload();
+    const res = await POST('/api/public/bookings', p);
+    rememberRequest('booking', res.token, `Room: ${p.title} (${fmtDT(p.start_at)})`);
+    const link = `${location.origin}/booking/${res.token}`;
+    render(
+      h('h1', {}, 'Booking request sent'),
+      bookingCheckView(res.check),
+      h('div', { class: 'card' },
+        h('p', {}, 'The church office will review your request. Keep this link to check whether it has been approved:'),
+        h('p', {}, h('a', { href: `/booking/${res.token}`, 'data-link': true }, link)),
+        h('button', { onclick: () => copyText(link) }, 'Copy link')),
+    );
+  }));
+  render(
+    h('h1', {}, 'Book a room'),
+    h('p', { class: 'muted' }, 'Ask to use a room at ', churchName, '. Every request is reviewed by the church office. ',
+      h('a', { href: '/rooms', 'data-link': true }, 'See what is already booked.')),
+    wrap,
+  );
+}
+
+const BOOKING_STATUS_TEXT = {
+  pending: 'Waiting for the church office to review your request.',
+  approved: 'Approved. The room is booked for you.',
+  declined: 'Sorry, this booking could not be approved.',
+  cancelled: 'This booking was cancelled.',
+};
+
+async function pageBookingStatus(token) {
+  const s = await GET(`/api/public/bookings/${token}`);
+  const cancelBtn = ['pending', 'approved'].includes(s.status) ? h('button', { class: 'danger' }, 'Cancel this booking') : null;
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', busy(cancelBtn, async () => {
+      if (!confirm(s.repeats ? 'Cancel this booking, including all its dates?' : 'Cancel this booking?')) return;
+      await POST(`/api/public/bookings/${token}/cancel`);
+      toast('Booking cancelled');
+      route();
+    }));
+  }
+  render(
+    h('h1', {}, s.title),
+    h('div', { class: 'card' },
+      h('div', { class: 'row' }, statusBadge(s.status), h('span', {}, BOOKING_STATUS_TEXT[s.status] || '')),
+      s.message ? h('div', { class: 'banner info', style: 'margin-top:1rem' }, 'Message from the church office: ', h('p', {}, s.message)) : null,
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'Room'), h('dd', {}, s.room),
+        h('dt', {}, 'When'), h('dd', {}, s.repeats ? s.description : fmtRange(s.start_at, s.end_at)),
+        s.cancelled_dates.length ? [h('dt', {}, 'Except'), h('dd', {}, s.cancelled_dates.map((d) => h('span', { class: 'pill' }, fmtDT(d))))] : null,
+        s.needs.length ? [h('dt', {}, 'Equipment'), h('dd', {}, s.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${n.name}`)))] : null,
+        s.av_support ? [h('dt', {}, 'AV help'), h('dd', {}, 'Requested')] : null)),
+    cancelBtn,
+  );
+}
+
 // ------------------------------------------------------------------- admin
 
 function pageLogin() {
@@ -466,6 +758,209 @@ async function pageLoans() {
             h('td', {}, fmtDT(l.return_at)),
             h('td', { class: 'num' }, l.item_count));
         })))),
+  );
+}
+
+// ---------------------------------------------------------- admin: bookings
+
+const BOOKING_FILTERS = [['open', 'Open'], ['pending', 'Pending'], ['approved', 'Approved'], ['declined', 'Declined'], ['cancelled', 'Cancelled'], ['all', 'All']];
+
+async function pageBookings() {
+  const status = new URLSearchParams(location.search).get('status') || 'open';
+  const [bookings, rooms] = await Promise.all([GET(`/api/bookings?status=${status}`), GET('/api/rooms')]);
+  const rName = Object.fromEntries(rooms.map((r) => [r.id, r.name]));
+  render(
+    h('div', { class: 'row' }, h('h1', {}, 'Room bookings'), h('span', { class: 'spacer' }),
+      h('a', { class: 'btn', href: '/rooms', 'data-link': true }, 'Availability'),
+      hasRole('bookings') ? h('a', { class: 'btn primary', href: '/admin/bookings/new', 'data-link': true }, '+ New booking') : null),
+    h('div', { class: 'row', style: 'margin-bottom:0.8rem' }, BOOKING_FILTERS.map(([k, label]) =>
+      h('a', { class: 'btn small' + (k === status ? ' primary' : ''), href: `/admin/bookings?status=${k}`, 'data-link': true }, label))),
+    bookings.length === 0 ? h('p', { class: 'muted' }, 'Nothing here.') :
+      h('div', { class: 'card table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, ['Status', 'Event', 'Room', 'When', 'Organiser'].map((t) => h('th', {}, t)))),
+        h('tbody', {}, bookings.map((b) => h('tr', { class: 'clickable', onclick: () => navigate(`/admin/bookings/${b.id}`) },
+          h('td', {}, statusBadge(b.status)),
+          h('td', {}, b.title,
+            b.av_support || b.needs.length ? h('div', {}, h('span', { class: 'pill' }, b.av_support ? 'AV help wanted' : 'Uses equipment')) : null),
+          h('td', {}, rName[b.room_id] || `#${b.room_id}`),
+          h('td', {}, b.recurrence === 'none' ? fmtRange(b.start_at, b.end_at) : b.description),
+          h('td', {}, b.organiser_name, b.organisation ? h('div', { class: 'muted small' }, b.organisation) : null)))))),
+  );
+}
+
+async function pageBookingEdit(id) {
+  if (!hasRole('bookings')) return render(h('h1', {}, 'Room booking'), needsRoleNote('bookings'));
+  const [rooms, existing] = await Promise.all([GET('/api/public/rooms'), id ? GET(`/api/bookings/${id}`) : null]);
+  const initial = existing ? existing.booking : {};
+  const form = bookingForm(rooms, initial, { staff: true });
+  const save = h('button', { type: 'submit', class: id ? 'primary' : '' }, id ? 'Save changes' : 'Save as pending');
+  const saveApprove = id ? null : h('button', { type: 'button', class: 'primary' }, 'Save & approve');
+  const wrap = h('form', {}, form.el, h('div', { class: 'row' }, saveApprove, save,
+    h('a', { class: 'btn', href: id ? `/admin/bookings/${id}` : '/admin/bookings', 'data-link': true }, 'Cancel')));
+  wrap.addEventListener('submit', busy(save, async () => {
+    if (id) {
+      await PUT(`/api/bookings/${id}`, form.payload());
+      toast('Saved');
+      return navigate(`/admin/bookings/${id}`);
+    }
+    const res = await POST('/api/bookings', form.payload());
+    toast('Booking saved as pending');
+    navigate(`/admin/bookings/${res.id}`);
+  }));
+  if (saveApprove) {
+    saveApprove.addEventListener('click', busy(saveApprove, async () => {
+      const res = await POST('/api/bookings', form.payload());
+      try {
+        await POST(`/api/bookings/${res.id}/approve`, {});
+        toast('Booking approved');
+      } catch (e) {
+        // Usually a clash: the detail page shows what and lets staff decide.
+        toast(`Saved as pending: ${e.message}`, true);
+      }
+      navigate(`/admin/bookings/${res.id}`);
+    }));
+  }
+  render(
+    h('div', { class: 'row' }, h('a', { href: id ? `/admin/bookings/${id}` : '/admin/bookings', 'data-link': true }, '← Back')),
+    h('h1', {}, id ? `Edit booking: ${initial.title}` : 'New room booking'),
+    id ? null : h('p', { class: 'muted' }, 'For bookings that came in by phone or email, or from the old spreadsheet.'),
+    wrap,
+  );
+}
+
+async function pageBooking(id) {
+  const d = await GET(`/api/bookings/${id}`);
+  const { booking: b, refs } = d;
+  const reload = () => pageBooking(id);
+  const canEdit = hasRole('bookings');
+  const groups = Object.values(refs.groups);
+
+  const message = h('textarea', { placeholder: 'Shown to the organiser on their status page' });
+  message.value = b.message_to_organiser;
+  const notes = h('textarea', { placeholder: 'Private notes' });
+  notes.value = b.admin_notes;
+  const saveNotes = h('button', { class: 'small' }, 'Save notes');
+  saveNotes.addEventListener('click', busy(saveNotes, async () => {
+    await PATCH(`/api/bookings/${id}`, { admin_notes: notes.value, message_to_organiser: message.value });
+    toast('Saved');
+  }));
+
+  const actions = [];
+  const act = (label, cls, fn) => {
+    const btn = h('button', { class: cls }, label);
+    btn.addEventListener('click', busy(btn, async () => { if (await fn() !== false) reload(); }));
+    actions.push(btn);
+  };
+  const setStatus = (status, confirmText) => async () => {
+    if (confirmText && !confirm(confirmText)) return false;
+    await POST(`/api/bookings/${id}/status`, { status, message: message.value });
+    toast(`Booking ${status}`);
+  };
+
+  // Which regular group the booking's event belongs to ("who to ask" for equipment).
+  const groupSel = h('select', {},
+    h('option', { value: 'new' }, `New group from organiser: ${b.organisation || b.organiser_name}`),
+    h('option', { value: '' }, 'No regular group (one-off)'),
+    groups.map((g) => h('option', { value: g.id }, g.name)));
+  const existing = groups.find((g) => g.name === (b.organisation || b.organiser_name));
+  groupSel.value = existing ? existing.id : b.recurrence === 'none' ? '' : 'new';
+  const approveBody = (extra) => ({
+    ...extra, message: message.value,
+    create_group: groupSel.value === 'new', group_id: groupSel.value && groupSel.value !== 'new' ? +groupSel.value : null,
+  });
+
+  const clashCount = d.clashes.length;
+  const total = d.dates.length;
+  if (canEdit && b.status === 'pending') {
+    if (!clashCount) {
+      act('Approve', 'primary', async () => { await POST(`/api/bookings/${id}/approve`, approveBody({})); toast('Approved'); });
+    } else {
+      if (clashCount < total) {
+        act(`Approve, skipping ${clashCount} clashing date${clashCount > 1 ? 's' : ''}`, 'primary', async () => {
+          await POST(`/api/bookings/${id}/approve`, approveBody({ skip_clashing: true }));
+          toast('Approved');
+        });
+      }
+      act('Approve anyway (double-book)', '', async () => {
+        if (!confirm('The room will be booked twice at the clashing times. Only do this if everyone involved has agreed. Continue?')) return false;
+        await POST(`/api/bookings/${id}/approve`, approveBody({ force: true }));
+        toast('Approved');
+      });
+    }
+    act('Decline', 'danger', setStatus('declined', 'Decline this booking? Put a reason in the message to the organiser first.'));
+  }
+  if (canEdit && b.status === 'approved') {
+    act('Back to pending', '', setStatus('pending', 'Take this booking off the calendar and return it to pending? Any changes made to its church event are lost.'));
+    act('Cancel booking', 'danger', setStatus('cancelled', 'Cancel this booking and free the room?'));
+  }
+  if (canEdit && ['declined', 'cancelled'].includes(b.status)) {
+    act('Reopen', '', setStatus('pending'));
+    act('Delete', 'danger', async () => {
+      if (!confirm('Delete this booking request permanently?')) return false;
+      await DEL(`/api/bookings/${id}`);
+      navigate('/admin/bookings');
+      return false;
+    });
+  }
+
+  const statusLink = `${location.origin}/booking/${b.token}`;
+  const withLink = (w) => {
+    const other = d.booked_events[w.event_id];
+    const label = `${w.title} (${fmtTime(w.start)}–${fmtTime(w.end)})`;
+    return other ? h('a', { href: `/admin/bookings/${other}`, 'data-link': true }, label) : label;
+  };
+  const clashList = h('ul', {}, d.clashes.slice(0, 30).map((c) => h('li', {}, fmtRange(c.start, c.end), ': ',
+    c.with.map((w, k) => [k ? ', ' : '', withLink(w)]))),
+  d.clashes.length > 30 ? h('li', {}, `…and ${d.clashes.length - 30} more`) : null);
+
+  render(
+    h('div', { class: 'row' }, h('a', { href: '/admin/bookings', 'data-link': true }, '← Room bookings')),
+    h('div', { class: 'row' }, h('h1', {}, b.title), statusBadge(b.status)),
+    h('div', { class: 'card' },
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'Room'), h('dd', {}, roomName(refs, b.room_id)),
+        h('dt', {}, 'When'), h('dd', {}, b.recurrence === 'none' ? fmtRange(b.start_at, b.end_at) : `${b.description} (${total} dates)`),
+        d.cancelled_dates.length ? [h('dt', {}, 'Not on'), h('dd', {}, d.cancelled_dates.map((x) => h('span', { class: 'pill' }, fmtDT(x))))] : null,
+        h('dt', {}, 'Organiser'), h('dd', {}, b.organiser_name, b.organisation ? ` (${b.organisation})` : ''),
+        h('dt', {}, 'Contact'), h('dd', {},
+          b.email ? h('a', { href: `mailto:${b.email}` }, b.email) : null, b.email && b.phone ? ' · ' : '',
+          b.phone ? h('a', { href: `tel:${b.phone}` }, b.phone) : null, !b.email && !b.phone ? '—' : null),
+        b.attendees ? [h('dt', {}, 'People'), h('dd', {}, b.attendees)] : null,
+        h('dt', {}, 'Equipment'), h('dd', {}, b.needs.length ? b.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${typeName(refs, n.type_id)}`)) : 'None',
+          b.av_support ? h('span', { class: 'pill changed' }, 'AV help wanted') : null),
+        h('dt', {}, 'Public calendar'), h('dd', {}, b.public_title ? `Shows "${b.title}"` : 'Shows "Booked"'),
+        b.notes ? [h('dt', {}, 'Notes'), h('dd', {}, b.notes)] : null,
+        b.decided_by ? [h('dt', {}, 'Decided by'), h('dd', {}, b.decided_by, b.decided_at ? h('span', { class: 'muted small' }, ` · ${fmtDT(b.decided_at)}`) : null)] : null),
+      h('div', { class: 'row', style: 'margin-top:0.8rem' },
+        h('span', { class: 'muted small' }, 'Organiser status link:'),
+        h('a', { href: `/booking/${b.token}`, target: '_blank', class: 'small' }, 'open'),
+        h('button', { class: 'small', onclick: () => copyText(statusLink) }, 'Copy'),
+        canEdit && b.status === 'pending' ? h('a', { class: 'btn small', href: `/admin/bookings/${id}/edit`, 'data-link': true }, 'Edit request') : null,
+        b.event_id ? h('a', { class: 'btn small', href: `/admin/schedule?from=${isoDate(toDate(b.start_at))}`, 'data-link': true }, 'View on schedule') : null)),
+
+    clashCount ? h('div', { class: b.status === 'pending' ? 'banner bad' : 'banner warn' },
+      b.status === 'pending'
+        ? (total > 1 ? `${clashCount} of ${total} dates clash with something already in the room:` : 'This clashes with something already in the room:')
+        : 'Overlaps with other things in the room:',
+      clashList) : b.status === 'pending'
+      ? h('div', { class: 'banner ok' }, total > 1 ? `The room is free on all ${total} dates.` : 'The room is free at that time.') : null,
+
+    d.competing_pending.length ? h('div', { class: 'banner info' }, 'Other pending requests want this room at overlapping times: ',
+      d.competing_pending.map((c, k) => [k ? ', ' : '', h('a', { href: `/admin/bookings/${c.id}`, 'data-link': true }, `${c.title} (${c.organiser_name})`)]),
+      h('p', {}, 'Whichever is approved first gets the room.')) : null,
+
+    d.equipment_impact.length ? h('div', { class: 'banner warn' }, 'The equipment this booking needs would leave approved loans short:',
+      h('ul', {}, d.equipment_impact.map((x) => h('li', {},
+        h('a', { href: `/admin/loans/${x.loan_id}`, 'data-link': true }, x.loan_name || `Loan #${x.loan_id}`),
+        `: short by ${x.short_by} × ${typeName(refs, x.type_id)} in ${roomName(refs, x.room_id)}`))),
+      h('p', {}, 'Talk to the AV team before approving, or approve with less equipment.')) : null,
+
+    canEdit ? h('div', { class: 'card' },
+      b.status === 'pending' ? field('Regular group for this booking', groupSel, { hint: 'Used to contact them if the AV team needs to borrow equipment they use. Repeat hirers usually get their own group.' }) : null,
+      field('Message to organiser', message),
+      field('Private notes', notes),
+      saveNotes) : needsRoleNote('bookings'),
+    h('div', { class: 'row' }, actions),
   );
 }
 
@@ -757,6 +1252,7 @@ async function pageSchedule() {
   const reload = () => pageSchedule();
   render(
     h('h1', {}, 'Church schedule'),
+    h('p', { class: 'muted' }, 'Church events and approved room bookings.'),
     h('div', { class: 'row card' }, field('From', fromIn), field('Show', daysIn)),
     d.loans.length ? h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Loans in this period'),
       d.loans.map((l) => h('div', { class: 'row' }, statusBadge(l.status),
@@ -782,6 +1278,8 @@ async function pageSchedule() {
             h('div', { class: 'time' }, `${fmtTime(o.start)}–${fmtTime(o.end)}`),
             h('div', { style: 'flex:1;min-width:220px' },
               h('div', {}, h('strong', {}, o.title), ` · ${roomName(refs, o.room_id)}`, group ? h('span', { class: 'muted' }, ` · ${group.name}`) : null,
+                d.booked_events[o.event_id] ? ' ' : null,
+                d.booked_events[o.event_id] ? h('a', { class: 'pill', href: `/admin/bookings/${d.booked_events[o.event_id]}`, 'data-link': true }, 'booking') : null,
                 o.cancelled ? h('span', { class: 'badge cancelled', style: 'margin-left:0.4rem' }, 'cancelled') : null),
               h('div', {}, Object.entries(o.needs).map(([t, q]) => {
                 const usual = o.usual_needs[t];
@@ -871,7 +1369,10 @@ function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, row
         }) }, 'Delete')));
     form.addEventListener('submit', busy(save, async () => {
       const body = { ...item };
-      for (const f of fields) body[f.key] = f.type === 'checkbox' ? inputs[f.key].checked : inputs[f.key].value;
+      for (const f of fields) {
+        const v = f.type === 'checkbox' ? inputs[f.key].checked : inputs[f.key].value;
+        body[f.key] = f.type === 'number' ? (v === '' ? null : Number(v)) : v;
+      }
       if (isNew) await POST(endpoint, body); else await PUT(`${endpoint}/${item.id}`, body);
       toast('Saved');
       route();
@@ -897,10 +1398,19 @@ function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, row
 async function pageRooms() {
   simpleCrud({
     title: 'Rooms', rowLabel: 'room', endpoint: '/api/rooms', items: await GET('/api/rooms'),
-    intro: 'Rooms (or storage areas) where equipment lives.',
-    blank: { name: '', notes: '' },
-    columns: [{ label: 'Name', key: 'name' }, { label: 'Notes', key: 'notes' }],
-    fields: [{ key: 'name', label: 'Name', required: true }, { key: 'notes', label: 'Notes', type: 'textarea' }],
+    intro: 'Rooms people can book, and storage areas where equipment lives.',
+    blank: { name: '', notes: '', bookable: true, capacity: null, public_notes: '' },
+    columns: [
+      { label: 'Name', key: 'name' },
+      { label: 'Bookable', render: (r) => (r.bookable ? 'Yes' : 'No') },
+      { label: 'Capacity', key: 'capacity', num: true },
+      { label: 'Staff notes', key: 'notes' }],
+    fields: [
+      { key: 'name', label: 'Name', required: true },
+      { key: 'capacity', label: 'Capacity (people)', type: 'number' },
+      { key: 'public_notes', label: 'Description for people booking', type: 'textarea', hint: 'e.g. "Kitchen next door, piano, seats 80"' },
+      { key: 'notes', label: 'Staff notes', type: 'textarea' },
+      { key: 'bookable', label: 'Can be booked online (untick for store rooms and offices)', type: 'checkbox' }],
   });
 }
 
@@ -980,16 +1490,19 @@ async function pageEvents() {
     const needs = itemsEditor(equipment, ev.needs.length ? ev.needs : []);
     const recFields = h('div', { class: 'grid' });
     const updateRec = () => {
-      recFields.replaceChildren(
+      recFields.replaceChildren(...[
         rec.value === 'weekly' ? field('Repeat', interval) : null,
         rec.value === 'monthly' ? field('Which', nth, { hint: 'Weekday is taken from the first date' }) : null,
-        rec.value !== 'none' ? field('Until (optional)', until) : null);
+        rec.value !== 'none' ? field('Until (optional)', until) : null].filter(Boolean));
     };
     rec.addEventListener('change', updateRec);
     updateRec();
     const save = h('button', { class: 'primary', type: 'submit' }, isNew ? 'Add event' : 'Save');
     const form = h('form', { class: 'card' },
       h('h2', { style: 'margin-top:0' }, isNew ? 'Add church event' : 'Edit church event'),
+      ev.booking_id ? h('div', { class: 'banner info' }, 'This event comes from ',
+        h('a', { href: `/admin/bookings/${ev.booking_id}`, 'data-link': true }, `room booking #${ev.booking_id}`),
+        h('p', {}, 'Changes here update the live booking. To remove it, cancel the booking.')) : null,
       h('div', { class: 'grid' },
         field('Title', title, { required: true }),
         field('Room', room, { required: true }),
@@ -1006,13 +1519,14 @@ async function pageEvents() {
       needs.el,
       h('div', { class: 'field', style: 'margin-top:1rem' }, h('label', {}, 'Notes'), notes),
       h('div', { class: 'row' }, save, h('button', { type: 'button', onclick: () => editor.replaceChildren() }, 'Cancel'),
-        isNew ? null : h('span', { class: 'spacer' }),
-        isNew ? null : h('button', { type: 'button', class: 'danger', onclick: busy(null, async () => {
+        isNew || ev.booking_id ? null : h('span', { class: 'spacer' }),
+        isNew || ev.booking_id ? null : h('button', { type: 'button', class: 'danger', onclick: busy(null, async () => {
           if (!confirm('Delete this event and all its occurrences?')) return;
           await DEL(`/api/events/${ev.id}`);
           route();
         }) }, 'Delete')));
     form.addEventListener('submit', busy(save, async () => {
+      if (!time.value || !endTime.value) throw new Error('Start and end times are required');
       const [sh, sm] = time.value.split(':').map(Number);
       const [eh, em] = endTime.value.split(':').map(Number);
       const duration = (+durDays.value || 0) * 1440 + (eh * 60 + em) - (sh * 60 + sm);
@@ -1023,9 +1537,17 @@ async function pageEvents() {
         recurrence: rec.value, interval_weeks: +interval.value, nth: +nth.value,
         until: rec.value === 'none' ? null : until.value || null, notes: notes.value, needs: needs.get(),
       };
-      if (isNew) await POST('/api/events', body); else await PUT(`/api/events/${ev.id}`, body);
+      const res = isNew ? await POST('/api/events', body) : await PUT(`/api/events/${ev.id}`, body);
       toast('Saved');
-      route();
+      if (!res.clashes.length) return route();
+      // Saved, but the room is double-booked on some dates: make sure staff see it.
+      editor.replaceChildren(h('div', { class: 'banner warn' },
+        `Saved, but "${body.title}" overlaps other things in ${rName[body.room_id]} on ${res.clashes.length} date${res.clashes.length > 1 ? 's' : ''}:`,
+        h('ul', {}, res.clashes.slice(0, 10).map((c) => h('li', {}, fmtRange(c.start, c.end), ': ', c.with.map((w) => w.title).join(', ')))),
+        res.clashes.length > 10 ? h('p', {}, `…and ${res.clashes.length - 10} more.`) : null,
+        h('p', {}, 'If that is not intended, change the time or room, or cancel the clashing dates on the Schedule page.'),
+        h('button', { onclick: () => route() }, 'OK')));
+      editor.scrollIntoView({ behavior: 'smooth' });
     }));
     editor.replaceChildren(form);
     form.scrollIntoView({ behavior: 'smooth' });
@@ -1045,7 +1567,8 @@ async function pageEvents() {
       [...byRoom].map(([roomId, evs]) => h('div', { class: 'card table-wrap' },
         h('h2', { style: 'margin-top:0' }, rName[roomId]),
         h('table', {}, h('tbody', {}, evs.map((e) => h('tr', { class: 'clickable', onclick: () => openEditor(e) },
-          h('td', {}, h('strong', {}, e.title), h('div', { class: 'muted small' }, e.group_id ? gName[e.group_id] : 'No regular group')),
+          h('td', {}, h('strong', {}, e.title), e.booking_id ? [' ', h('span', { class: 'pill' }, 'booking')] : null,
+            h('div', { class: 'muted small' }, e.group_id ? gName[e.group_id] : 'No regular group')),
           h('td', {}, e.description),
           h('td', {}, e.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${tName[n.type_id]}`))))))))),
   );
@@ -1068,7 +1591,7 @@ async function pageSettings() {
     toast('Saved');
   }));
 
-  const links = [['Borrow equipment', '/request']];
+  const links = [['Book a room', '/book'], ['Room availability', '/rooms'], ['Borrow equipment', '/request']];
   render(
     h('h1', {}, 'Settings'),
     accountCard(),

@@ -175,3 +175,17 @@ dialog::backdrop { background: rgba(0,0,0,0.45); }
 }
 
 .nav .count { display: inline-block; min-width: 1.3em; margin-left: 0.35rem; padding: 0 0.35rem; border-radius: 99px; background: var(--warn-bg); color: var(--warn); font-size: 0.75rem; font-weight: 700; text-align: center; }
+
+.avail-row { display: flex; gap: 0.8rem; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.avail-room { width: 9rem; font-weight: 600; }
+.avail-busy { flex: 1; min-width: 200px; }
+.pill.busy { background: var(--bad-bg); border-color: transparent; color: var(--text); }
+.timeline {
+  position: relative; height: 8px; margin: 0.2rem 0 0.35rem; border-radius: 99px;
+  /* faint ticks at 06:00, 12:00 and 18:00 */
+  background: linear-gradient(90deg, transparent calc(25% - 1px), var(--border) 25%, transparent calc(25% + 1px),
+    transparent calc(50% - 1px), var(--border) 50%, transparent calc(50% + 1px),
+    transparent calc(75% - 1px), var(--border) 75%, transparent calc(75% + 1px)), var(--bg);
+}
+.timeline span { position: absolute; top: 0; bottom: 0; background: var(--bad); border-radius: 99px; opacity: 0.75; }
+.row > input:not([type=checkbox]), .row > select { width: auto; flex: 0 1 auto; }
