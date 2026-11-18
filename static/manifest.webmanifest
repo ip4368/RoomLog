@@ -1,6 +1,6 @@
 {
-  "name": "Quippy – Church AV Equipment",
-  "short_name": "Quippy",
+  "name": "RoomLog – Church rooms & AV equipment",
+  "short_name": "RoomLog",
   "description": "Church AV equipment inventory and loans",
   "start_url": "/",
   "scope": "/",

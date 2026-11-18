@@ -20,7 +20,7 @@ use crate::db::{self, OccurrenceView, fmt_dt, parse_dt};
 use crate::engine::{self, Evaluation, Id};
 use crate::recurrence::{Recurrence, Span};
 
-const SESSION_COOKIE: &str = "quippy_session";
+const SESSION_COOKIE: &str = "roomlog_session";
 const SESSION_DAYS: i64 = 30;
 const MAX_TEXT: usize = 4000;
 const MAX_ITEMS: usize = 100;
@@ -184,7 +184,7 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Respon
     let mut resp = Json(json!({ "ok": true })).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("quippy_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        HeaderValue::from_static("roomlog_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
     );
     Ok(resp)
 }

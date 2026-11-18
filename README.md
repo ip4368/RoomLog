@@ -1,4 +1,4 @@
-# Quippy: church AV equipment & loans
+# RoomLog: church rooms, AV equipment & loans
 
 A small self-hosted service for a church AV team:
 
@@ -18,18 +18,22 @@ It is a single Rust binary (axum + SQLite) with an installable PWA frontend buil
 cargo build --release
 
 # Optional: load sample rooms, equipment, groups and events to try it out
-DATABASE_PATH=quippy.db ./target/release/quippy seed-demo
+DATABASE_PATH=roomlog.db ./target/release/roomlog seed-demo
 
-ADMIN_PASSWORD='choose-a-good-password' DATABASE_PATH=quippy.db ./target/release/quippy
+ADMIN_PASSWORD='choose-a-good-password' DATABASE_PATH=roomlog.db ./target/release/roomlog
 # → http://localhost:8080
 ```
 
 | Environment variable | Default        | Meaning                                                       |
 |----------------------|----------------|---------------------------------------------------------------|
 | `ADMIN_PASSWORD`     | *(required)*   | Password for the AV team console (min 8 chars)                |
-| `DATABASE_PATH`      | `quippy.db`    | SQLite file. Back this file up (it's the whole system).       |
+| `DATABASE_PATH`      | `roomlog.db`   | SQLite file. Back this file up (it's the whole system).       |
 | `BIND`               | `0.0.0.0:8080` | Listen address                                                |
 | `COOKIE_SECURE`      | off            | Set to `1` when served over HTTPS (recommended)               |
+
+> **Upgrading from Quippy:** the project was renamed. If `DATABASE_PATH` isn't set and only
+> the old `quippy.db` exists, RoomLog keeps using it (and says so at startup); rename the file to
+> `roomlog.db` when convenient. AV team members will need to log in once more after upgrading.
 
 Put it behind HTTPS (e.g. Caddy, or a Cloudflare Tunnel) if it's reachable from the internet.
 Browsers only offer to install the PWA, and only enable the service worker, over

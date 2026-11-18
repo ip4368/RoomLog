@@ -1,5 +1,5 @@
 'use strict';
-/* Quippy — church AV equipment inventory & loans. Vanilla JS, no build step. */
+/* RoomLog — church rooms, AV equipment inventory & loans. Vanilla JS, no build step. */
 
 // ------------------------------------------------------------------ helpers
 
@@ -207,7 +207,7 @@ async function route() {
 
 // ------------------------------------------------------------------ public
 
-let churchName = 'Quippy';
+let churchName = 'RoomLog';
 async function loadInfo() {
   try {
     const info = await GET('/api/public/info');
@@ -216,11 +216,20 @@ async function loadInfo() {
   } catch (_) { /* offline */ }
 }
 
+const MY_REQUESTS_KEY = 'roomlog.myRequests';
+// Status links organisers saved before the rename from Quippy.
+const LEGACY_MY_REQUESTS_KEY = 'quippy.myRequests';
+
+function myRequests() {
+  const saved = localStorage.getItem(MY_REQUESTS_KEY) ?? localStorage.getItem(LEGACY_MY_REQUESTS_KEY);
+  return JSON.parse(saved || '[]');
+}
+
 async function pageHome() {
   let admin = false;
   try { await fetch('/api/me', { credentials: 'same-origin' }).then((r) => { admin = r.ok; }); } catch (_) {}
   if (admin) return navigate('/admin', true);
-  const mine = JSON.parse(localStorage.getItem('quippy.myRequests') || '[]');
+  const mine = myRequests();
   render(
     h('div', { class: 'hero' },
       h('h1', {}, `${churchName} AV equipment`),
@@ -326,9 +335,9 @@ async function pageRequestForm() {
     const p = payload();
     if (!p.event_name.trim()) throw new Error('Event name is required');
     const res = await POST('/api/public/requests', p);
-    const mine = JSON.parse(localStorage.getItem('quippy.myRequests') || '[]');
+    const mine = myRequests();
     mine.unshift({ token: res.token, label: `${p.event_name} (${fmtDT(p.pickup_at)})` });
-    localStorage.setItem('quippy.myRequests', JSON.stringify(mine.slice(0, 20)));
+    localStorage.setItem(MY_REQUESTS_KEY, JSON.stringify(mine.slice(0, 20)));
     const link = `${location.origin}/status/${res.token}`;
     render(
       h('h1', {}, 'Request sent'),

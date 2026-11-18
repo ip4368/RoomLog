@@ -57,11 +57,26 @@ pub fn app(state: api::AppState) -> axum::Router {
     api::router(state).fallback(static_handler)
 }
 
+const DEFAULT_DB: &str = "roomlog.db";
+/// Database file used before the project was renamed from Quippy.
+const LEGACY_DB: &str = "quippy.db";
+
+/// Keep existing installs working: if only the pre-rename database exists,
+/// carry on using it rather than silently starting with an empty one.
+fn default_db_path() -> String {
+    let exists = |p: &str| std::path::Path::new(p).exists();
+    if !exists(DEFAULT_DB) && exists(LEGACY_DB) {
+        eprintln!("Using legacy database {LEGACY_DB}; rename it to {DEFAULT_DB} or set DATABASE_PATH");
+        return LEGACY_DB.into();
+    }
+    DEFAULT_DB.into()
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
 
-    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "quippy.db".into());
+    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| default_db_path());
     let conn = db::open(&db_path).unwrap_or_else(|e| {
         eprintln!("Failed to open database {db_path}: {e}");
         std::process::exit(1);
@@ -99,6 +114,6 @@ async fn main() {
         eprintln!("Failed to bind {bind}: {e}");
         std::process::exit(1);
     });
-    tracing::info!("Quippy listening on http://{bind} (database: {db_path})");
+    tracing::info!("RoomLog listening on http://{bind} (database: {db_path})");
     axum::serve(listener, app(state)).await.expect("server error");
 }

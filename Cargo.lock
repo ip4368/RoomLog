@@ -559,25 +559,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quippy"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "http-body-util",
- "mime_guess",
- "rand",
- "rusqlite",
- "rust-embed",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,6 +604,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "roomlog"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "http-body-util",
+ "mime_guess",
+ "rand",
+ "rusqlite",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

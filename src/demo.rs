@@ -1,4 +1,4 @@
-//! Sample data so the system can be tried out straight away (`quippy seed-demo`).
+//! Sample data so the system can be tried out straight away (`roomlog seed-demo`).
 
 use rusqlite::{Connection, params};
 
