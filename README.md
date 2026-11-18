@@ -1,7 +1,10 @@
 # RoomLog: church rooms, AV equipment & loans
 
-A small self-hosted service for a church AV team:
+A small self-hosted service for a church office and AV team:
 
+* One place for **room bookings**. Anyone can see what's already booked and request a room;
+  the church office approves. Approving *is* recording it, so the calendar can't fall behind
+  and the room can't be double-booked by accident.
 * Record **what equipment lives in each room**.
 * Record **church events** (regular or one-off) and the **minimum equipment each needs to stay in its room**.
 * Give external **event organisers a form** to request a loan. The system works out
@@ -57,9 +60,10 @@ HTTPS or on `localhost`.
 
 ## Using it
 
-**Set up (once):** go to `/admin/login`, then:
+**Set up (once):** go to `/admin/login`, log in as `admin`, add staff under **Users**, then:
 
-1. **Rooms**: e.g. Main Hall, Youth Room, Chapel, AV Store.
+1. **Rooms**: e.g. Main Hall, Youth Room, Chapel, AV Store. Untick *can be booked online*
+   for store rooms, and add a capacity and description for the rest.
 2. **Equipment**: types of gear (e.g. "Shure SM58"). Untick *lendable* for installed equipment.
 3. **Stock**: a grid of how many of each type live in each room.
 4. **Groups**: regular users and their point of contact.
@@ -67,12 +71,38 @@ HTTPS or on `localhost`.
    needs 5 × SM58, 4 × DI box…". Events can be one-off, every N weeks, or the
    nth/last weekday of the month.
 
+### Room bookings
+
+**Organisers** use `/rooms` to see what's already booked, then `/book` to ask for a room:
+date and exact times (any start and end; include set-up and pack-down), optionally repeating
+weekly, every N weeks or monthly (up to a year), the equipment they'd like to use from that
+room, and whether they'd like AV help. **Check availability** shows any clashes date by date
+before they submit. They get a private status link showing the decision and any message.
+
+**The church office** (`Bookings`, with a pending count) opens a request and sees:
+
+* whether the room is free on every date, or exactly which dates clash and with what;
+* other pending requests for the same room and time (whichever is approved first gets it);
+* whether the equipment it needs would leave an already approved loan short.
+
+Then **Approve**, **Approve, skipping the clashing dates**, **Approve anyway** (deliberate
+double-booking) or **Decline**, with a message to the organiser. Approval re-checks clashes
+at the moment it's saved. An approved booking becomes a church event linked to the request,
+so it shows on the schedule, its equipment is kept in the room, single dates can be cancelled,
+and repeat hirers can be linked to a group so the AV team knows who to ask about equipment.
+Bookings that arrive by phone or email go in through **+ New booking** (*Save & approve*).
+
+The public calendar shows church events by name and external bookings as "Booked", unless the
+organiser ticked *show the event name*. Pending requests aren't shown.
+
+### Equipment loans
+
 **When an organiser gets in touch:** send them the link from *Settings* (`/request`).
 They pick dates and equipment, can check availability straight away, and submit.
 They get a private status link. Once the loan is approved, that page shows
 which room to collect each item from. They never see group contact details.
 
-**Reviewing a request** (`Requests` → click one):
+**Reviewing a request** (`Loans` → click one):
 
 * **Availability & where to collect**: per item, how many can be lent and from which rooms.
 * **Who to ask** (only if short): each group whose event would need to manage with less,
@@ -88,6 +118,13 @@ Other tools: **Quick check** (ad-hoc "can we lend X on these dates?"), **Schedul
 (upcoming church events, cancel a single date such as school holidays, see what's out on loan).
 
 ## How availability is worked out
+
+**Rooms:** a room holds one thing at a time. A request clashes with any church event or
+approved booking in that room that overlaps it, to the minute: 10:00–12:00 and 12:00–14:00
+don't clash, and overnight bookings are checked across midnight. Saving a church event that
+overlaps something still works (it may be intended), but staff are shown the clashing dates.
+
+**Equipment:**
 
 * A loan occupies its equipment from **pickup** until **return + turnaround buffer**
   (Settings, default 12 h). Gear that's collected but overdue stays occupied until it's marked returned.
@@ -112,8 +149,12 @@ cargo test          # engine, recurrence and end-to-end API tests
 cargo run -- seed-demo && ADMIN_PASSWORD=devpassword cargo run
 ```
 
-* `src/engine.rs`: pure availability/allocation/negotiation logic (unit-tested)
+* `src/engine.rs`: pure equipment availability/allocation/negotiation logic (unit-tested)
+* `src/clash.rs`: pure room clash detection (unit-tested)
 * `src/recurrence.rs`: expands recurring events into occurrences
-* `src/db.rs`: SQLite schema and snapshot loading
-* `src/api.rs`: JSON API (admin + public)
+* `src/db.rs`: SQLite schema, migrations (`PRAGMA user_version`) and snapshot loading
+* `src/auth.rs`: staff accounts, roles and sessions
+* `src/bookings.rs`: room booking API (staff + public)
+* `src/api.rs`: the rest of the JSON API (admin + public)
+* `docs/room-booking.md`: why bookings work the way they do
 * `static/`: the PWA (vanilla JS, no build step), embedded into the binary at compile time
