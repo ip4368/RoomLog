@@ -6,7 +6,7 @@ use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::engine::{Holding, Id, Occurrence, World};
+use crate::engine::{self, Catalog, Holding, Id, Occurrence, Want, World};
 use crate::recurrence::{Recurrence, Rule, Span};
 
 pub const DT_FMT: &str = "%Y-%m-%dT%H:%M:%S";
@@ -190,7 +190,130 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (booking_id, type_id)
     );
     "#,
+    // 3: equipment kinds (see docs/equipment-kinds.md). Kinds form a tree;
+    // models (equipment_types) hang under a kind. Request lines and needs
+    // name either "any of a kind" or "exactly this model". Existing
+    // categories become top-level, not-requestable kinds and existing lines
+    // become exact-model lines, so nothing behaves differently until the AV
+    // team builds out the tree. equipment_types is altered, never rebuilt:
+    // dropping it would cascade-delete stock, needs and allocations.
+    r#"
+    CREATE TABLE equipment_kinds (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        parent_id   INTEGER REFERENCES equipment_kinds(id) ON DELETE RESTRICT,
+        requestable INTEGER NOT NULL DEFAULT 1,
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        notes       TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX idx_kinds_parent ON equipment_kinds(parent_id);
+    INSERT INTO equipment_kinds(name, requestable)
+        SELECT DISTINCT TRIM(category), 0 FROM equipment_types WHERE TRIM(category) <> '';
+    ALTER TABLE equipment_types ADD COLUMN kind_id INTEGER REFERENCES equipment_kinds(id) ON DELETE RESTRICT;
+    UPDATE equipment_types SET kind_id = (SELECT k.id FROM equipment_kinds k WHERE k.name = TRIM(equipment_types.category));
+    ALTER TABLE equipment_types DROP COLUMN category;
+    CREATE INDEX idx_types_kind ON equipment_types(kind_id);
+
+    CREATE TABLE event_needs_v3 (
+        id       INTEGER PRIMARY KEY,
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        kind_id  INTEGER REFERENCES equipment_kinds(id) ON DELETE CASCADE,
+        type_id  INTEGER REFERENCES equipment_types(id) ON DELETE CASCADE,
+        quantity INTEGER NOT NULL CHECK (quantity >= 0),
+        CHECK ((kind_id IS NULL) <> (type_id IS NULL))
+    );
+    INSERT INTO event_needs_v3(event_id, type_id, quantity) SELECT event_id, type_id, quantity FROM event_needs;
+    DROP TABLE event_needs;
+    ALTER TABLE event_needs_v3 RENAME TO event_needs;
+    CREATE UNIQUE INDEX ux_event_needs_kind ON event_needs(event_id, kind_id) WHERE kind_id IS NOT NULL;
+    CREATE UNIQUE INDEX ux_event_needs_model ON event_needs(event_id, type_id) WHERE type_id IS NOT NULL;
+
+    CREATE TABLE booking_needs_v3 (
+        id         INTEGER PRIMARY KEY,
+        booking_id INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+        kind_id    INTEGER REFERENCES equipment_kinds(id) ON DELETE CASCADE,
+        type_id    INTEGER REFERENCES equipment_types(id) ON DELETE CASCADE,
+        quantity   INTEGER NOT NULL CHECK (quantity > 0),
+        CHECK ((kind_id IS NULL) <> (type_id IS NULL))
+    );
+    INSERT INTO booking_needs_v3(booking_id, type_id, quantity) SELECT booking_id, type_id, quantity FROM booking_needs;
+    DROP TABLE booking_needs;
+    ALTER TABLE booking_needs_v3 RENAME TO booking_needs;
+    CREATE UNIQUE INDEX ux_booking_needs_kind ON booking_needs(booking_id, kind_id) WHERE kind_id IS NOT NULL;
+    CREATE UNIQUE INDEX ux_booking_needs_model ON booking_needs(booking_id, type_id) WHERE type_id IS NOT NULL;
+
+    CREATE TABLE loan_items_v3 (
+        id       INTEGER PRIMARY KEY,
+        loan_id  INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+        kind_id  INTEGER REFERENCES equipment_kinds(id) ON DELETE CASCADE,
+        type_id  INTEGER REFERENCES equipment_types(id) ON DELETE CASCADE,
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        CHECK ((kind_id IS NULL) <> (type_id IS NULL))
+    );
+    INSERT INTO loan_items_v3(loan_id, type_id, quantity) SELECT loan_id, type_id, quantity FROM loan_items;
+    DROP TABLE loan_items;
+    ALTER TABLE loan_items_v3 RENAME TO loan_items;
+    CREATE UNIQUE INDEX ux_loan_items_kind ON loan_items(loan_id, kind_id) WHERE kind_id IS NOT NULL;
+    CREATE UNIQUE INDEX ux_loan_items_model ON loan_items(loan_id, type_id) WHERE type_id IS NOT NULL;
+
+    ALTER TABLE occurrence_overrides ADD COLUMN kind_id INTEGER REFERENCES equipment_kinds(id) ON DELETE CASCADE;
+    "#,
 ];
+
+/// Turns a `(kind_id, type_id)` pair read from a line table into a [`Want`].
+pub fn want_from_db(kind_id: Option<Id>, type_id: Option<Id>) -> Option<Want> {
+    match (kind_id, type_id) {
+        (Some(k), None) => Some(Want::Kind(k)),
+        (None, Some(t)) => Some(Want::Model(t)),
+        _ => None,
+    }
+}
+
+/// Reads the request lines of one parent row from a line table
+/// (`loan_items`, `booking_needs` or `event_needs`).
+pub fn load_lines(conn: &Connection, table: &str, parent_col: &str, parent: Id) -> rusqlite::Result<Vec<engine::Line>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT kind_id, type_id, quantity FROM {table} WHERE {parent_col} = ?1 ORDER BY kind_id IS NULL, kind_id, type_id"
+    ))?;
+    let rows = stmt.query_map([parent], |r| Ok((r.get::<_, Option<Id>>(0)?, r.get::<_, Option<Id>>(1)?, r.get::<_, i64>(2)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (k, t, quantity) = row?;
+        if let Some(want) = want_from_db(k, t) {
+            out.push(engine::Line { want, quantity });
+        }
+    }
+    Ok(out)
+}
+
+/// Replaces the request lines of one parent row.
+pub fn save_lines(conn: &Connection, table: &str, parent_col: &str, parent: Id, lines: &[(Want, i64)]) -> rusqlite::Result<()> {
+    conn.execute(&format!("DELETE FROM {table} WHERE {parent_col} = ?1"), [parent])?;
+    let sql = format!("INSERT INTO {table}({parent_col}, kind_id, type_id, quantity) VALUES (?1, ?2, ?3, ?4)");
+    for (w, q) in lines {
+        conn.execute(&sql, params![parent, w.kind_id(), w.type_id(), q])?;
+    }
+    Ok(())
+}
+
+/// The shape of the equipment tree, for the engine.
+pub fn load_catalog(conn: &Connection) -> rusqlite::Result<Catalog> {
+    let mut cat = Catalog::default();
+    let mut stmt = conn.prepare("SELECT id, parent_id FROM equipment_kinds")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, Option<Id>>(1)?)))? {
+        let (id, parent) = row?;
+        cat.kind_parent.insert(id, parent);
+    }
+    let mut stmt = conn.prepare("SELECT id, kind_id, lendable FROM equipment_types")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, Option<Id>>(1)?, r.get::<_, bool>(2)?)))? {
+        let (id, kind, lendable) = row?;
+        cat.model_kind.insert(id, kind);
+        if lendable {
+            cat.lendable.insert(id);
+        }
+    }
+    Ok(cat)
+}
 
 pub fn open(path: &str) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open(path)?;
@@ -200,8 +323,21 @@ pub fn open(path: &str) -> rusqlite::Result<Connection> {
 }
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    migrate_to(conn, MIGRATIONS.len())
+}
+
+/// Opens a database as an older release would have left it (tests only).
+#[cfg(test)]
+pub fn open_at_version(path: &str, version: usize) -> rusqlite::Result<Connection> {
+    let mut conn = Connection::open(path)?;
+    conn.execute_batch(SCHEMA)?;
+    migrate_to(&mut conn, version)?;
+    Ok(conn)
+}
+
+fn migrate_to(conn: &mut Connection, target: usize) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    for (i, sql) in (1..).zip(MIGRATIONS.iter()).skip(usize::try_from(version).unwrap_or(0)) {
+    for (i, sql) in (1..).zip(MIGRATIONS.iter().take(target)).skip(usize::try_from(version).unwrap_or(0)) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", i64::from(i))?;
@@ -259,7 +395,7 @@ pub struct EventRow {
     pub group_id: Option<Id>,
     pub rule: Rule,
     pub notes: String,
-    pub needs: BTreeMap<Id, i64>,
+    pub needs: BTreeMap<Want, i64>,
 }
 
 pub fn recurrence_from_db(kind: &str, interval: i64, nth: i64) -> Recurrence {
@@ -271,11 +407,15 @@ pub fn recurrence_from_db(kind: &str, interval: i64, nth: i64) -> Recurrence {
 }
 
 pub fn load_events(conn: &Connection) -> rusqlite::Result<Vec<EventRow>> {
-    let mut needs: HashMap<Id, BTreeMap<Id, i64>> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT event_id, type_id, quantity FROM event_needs")?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, Id>(1)?, r.get::<_, i64>(2)?)))? {
-        let (e, t, q) = row?;
-        needs.entry(e).or_default().insert(t, q);
+    let mut needs: HashMap<Id, BTreeMap<Want, i64>> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT event_id, kind_id, type_id, quantity FROM event_needs")?;
+    for row in stmt.query_map([], |r| {
+        Ok((r.get::<_, Id>(0)?, r.get::<_, Option<Id>>(1)?, r.get::<_, Option<Id>>(2)?, r.get::<_, i64>(3)?))
+    })? {
+        let (e, k, t, q) = row?;
+        if let Some(w) = want_from_db(k, t) {
+            needs.entry(e).or_default().insert(w, q);
+        }
     }
     let mut stmt = conn.prepare(
         "SELECT id, title, room_id, group_id, start_date, start_time, duration_minutes,
@@ -317,6 +457,9 @@ pub struct OverrideRow {
     pub id: Id,
     pub event_id: Id,
     pub occurrence_start: NaiveDateTime,
+    /// Set when a group agreed to manage with less "any of this kind".
+    pub kind_id: Option<Id>,
+    /// Set when a group agreed to manage with less of this exact model.
     pub type_id: Option<Id>,
     pub quantity: i64,
     pub note: String,
@@ -325,7 +468,7 @@ pub struct OverrideRow {
 
 pub fn load_overrides(conn: &Connection) -> rusqlite::Result<Vec<OverrideRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, event_id, occurrence_start, type_id, quantity, note, loan_id FROM occurrence_overrides",
+        "SELECT id, event_id, occurrence_start, type_id, quantity, note, loan_id, kind_id FROM occurrence_overrides",
     )?;
     let rows = stmt.query_map([], |r| {
         let s: String = r.get(2)?;
@@ -337,9 +480,17 @@ pub fn load_overrides(conn: &Connection) -> rusqlite::Result<Vec<OverrideRow>> {
             quantity: r.get(4)?,
             note: r.get(5)?,
             loan_id: r.get(6)?,
+            kind_id: r.get(7)?,
         })
     })?;
     rows.collect()
+}
+
+impl OverrideRow {
+    /// The need this override changes; `None` means the occurrence is cancelled.
+    pub fn want(&self) -> Option<Want> {
+        want_from_db(self.kind_id, self.type_id)
+    }
 }
 
 /// A concrete occurrence with display info and overrides applied.
@@ -353,9 +504,11 @@ pub struct OccurrenceView {
     pub end: NaiveDateTime,
     pub cancelled: bool,
     /// Effective needs after overrides.
-    pub needs: BTreeMap<Id, i64>,
+    #[serde(serialize_with = "engine::ser_lines")]
+    pub needs: BTreeMap<Want, i64>,
     /// Usual needs from the event definition.
-    pub usual_needs: BTreeMap<Id, i64>,
+    #[serde(serialize_with = "engine::ser_lines")]
+    pub usual_needs: BTreeMap<Want, i64>,
     pub overrides: Vec<OverrideRow>,
 }
 
@@ -372,10 +525,10 @@ pub fn expand_occurrences(conn: &Connection, window: &Span) -> rusqlite::Result<
             let mut needs = e.needs.clone();
             let mut cancelled = false;
             for o in &ovs {
-                match o.type_id {
+                match o.want() {
                     None => cancelled = true,
-                    Some(t) => {
-                        needs.insert(t, o.quantity);
+                    Some(w) => {
+                        needs.insert(w, o.quantity);
                     }
                 }
             }
@@ -446,11 +599,8 @@ pub fn load_world(
     buffer_hours: i64,
     now: NaiveDateTime,
 ) -> rusqlite::Result<World> {
-    let mut world = World::default();
-    let mut stmt = conn.prepare(
-        "SELECT s.room_id, s.type_id, s.quantity FROM stock s
-         JOIN equipment_types t ON t.id = s.type_id WHERE s.quantity > 0",
-    )?;
+    let mut world = World { catalog: load_catalog(conn)?, ..World::default() };
+    let mut stmt = conn.prepare("SELECT room_id, type_id, quantity FROM stock WHERE quantity > 0")?;
     for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, Id>(1)?, r.get::<_, i64>(2)?)))? {
         let (room, ty, q) = row?;
         world.stock.insert((room, ty), q);

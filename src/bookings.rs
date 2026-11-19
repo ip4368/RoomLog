@@ -6,7 +6,7 @@
 //! on the schedule like any other event. Approval re-checks for clashes while
 //! holding the database lock, so two approvals can't both take the same slot.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -16,11 +16,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, ApiResult, AppState, clean, load_refs, now, random_token, required};
+use crate::api::{ApiError, ApiResult, AppState, clean, load_refs, now, random_token, required, validate_lines};
 use crate::auth::{Role, Staff};
 use crate::clash::{self, Busy, Clash};
 use crate::db::{self, fmt_dt, parse_dt, recurrence_from_db, recurrence_to_db};
-use crate::engine::{self, Id, Occurrence};
+use crate::engine::{self, Id, Line, Occurrence, Want};
 use crate::recurrence::{Recurrence, Rule, Span, nth_weekday_of_month};
 
 /// One-off bookings can run overnight or over several days.
@@ -31,12 +31,6 @@ const MAX_REPEATING_MINUTES: i64 = 24 * 60;
 const MAX_REPEAT_DAYS: i64 = 366;
 
 // ------------------------------------------------------------------ input
-
-#[derive(Deserialize, Serialize, Clone)]
-pub struct NeedIn {
-    type_id: Id,
-    quantity: i64,
-}
 
 #[derive(Deserialize, Clone)]
 pub struct BookingIn {
@@ -63,7 +57,7 @@ pub struct BookingIn {
     nth: i64,
     until: Option<String>,
     #[serde(default)]
-    needs: Vec<NeedIn>,
+    needs: Vec<Line>,
     #[serde(default)]
     av_support: bool,
     #[serde(default)]
@@ -84,7 +78,7 @@ fn one() -> i64 {
 struct Slot {
     room_id: Id,
     rule: Rule,
-    needs: Vec<(Id, i64)>,
+    needs: Vec<(Want, i64)>,
 }
 
 fn minute(dt: NaiveDateTime) -> NaiveDateTime {
@@ -144,6 +138,19 @@ fn occurrences(rule: &Rule) -> Vec<Span> {
     rule.occurrences_in(&window)
 }
 
+/// Units the room owns at or below every node of the equipment tree.
+fn room_stock_under(conn: &Connection, cat: &engine::Catalog, room_id: Id) -> rusqlite::Result<HashMap<Want, i64>> {
+    let mut stmt = conn.prepare("SELECT type_id, quantity FROM stock WHERE room_id = ?1 AND quantity > 0")?;
+    let mut out: HashMap<Want, i64> = HashMap::new();
+    for row in stmt.query_map([room_id], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))? {
+        let (t, q) = row?;
+        for a in cat.path(Want::Model(t)) {
+            *out.entry(a).or_insert(0) += q;
+        }
+    }
+    Ok(out)
+}
+
 fn validate_slot(conn: &Connection, b: &BookingIn, public: bool) -> Result<Slot, ApiError> {
     let room: Option<(String, bool)> = conn
         .query_row("SELECT name, bookable FROM rooms WHERE id = ?1", [b.room_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -158,28 +165,26 @@ fn validate_slot(conn: &Connection, b: &BookingIn, public: bool) -> Result<Slot,
     if public && rule.start_date.and_time(rule.start_time) < now() {
         return Err(ApiError::bad("Please choose a time in the future"));
     }
-    if b.needs.len() > 100 {
-        return Err(ApiError::bad("Too many equipment items"));
-    }
-    let mut merged: BTreeMap<Id, i64> = BTreeMap::new();
-    for n in b.needs.iter().filter(|n| n.quantity != 0) {
-        if n.quantity < 0 {
-            return Err(ApiError::bad("Quantities can't be negative"));
+    // Booking needs use the room's own gear, installed or not, so lendability
+    // doesn't matter here.
+    let merged = validate_lines(conn, &b.needs, false, 0)?;
+    // The needs must fit the room's stock together: at every node of the
+    // tree, what's asked for at or below it can't exceed what's owned below it.
+    if !merged.is_empty() {
+        let cat = db::load_catalog(conn)?;
+        let mut asked: BTreeMap<Want, i64> = BTreeMap::new();
+        for (&w, &q) in &merged {
+            for a in cat.path(w) {
+                *asked.entry(a).or_insert(0) += q;
+            }
         }
-        *merged.entry(n.type_id).or_insert(0) += n.quantity;
-    }
-    for (&type_id, &qty) in &merged {
-        let (name, in_room): (Option<String>, i64) = conn.query_row(
-            "SELECT t.name, COALESCE(s.quantity, 0) FROM equipment_types t
-             LEFT JOIN stock s ON s.type_id = t.id AND s.room_id = ?1 WHERE t.id = ?2",
-            params![b.room_id, type_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .unwrap_or((None, 0));
-        let name = name.ok_or_else(|| ApiError::bad("Unknown equipment type"))?;
-        if qty > in_room {
-            return Err(ApiError::bad(format!("{room_name} only has {in_room} × {name}")));
+        let owned = room_stock_under(conn, &cat, b.room_id)?;
+        let refs = load_refs(conn)?;
+        for (w, q) in asked {
+            let have = owned.get(&w).copied().unwrap_or(0);
+            if q > have {
+                return Err(ApiError::bad(format!("{room_name} only has {have} × {}", refs.want_name(w))));
+            }
         }
     }
     Ok(Slot { room_id: b.room_id, rule, needs: merged.into_iter().collect() })
@@ -245,7 +250,7 @@ pub struct BookingDto {
     decided_at: Option<NaiveDateTime>,
     created_at: NaiveDateTime,
     updated_at: NaiveDateTime,
-    needs: Vec<NeedIn>,
+    needs: Vec<Line>,
     #[serde(skip)]
     rule: Rule,
 }
@@ -303,8 +308,7 @@ fn row_to_booking(r: &rusqlite::Row) -> rusqlite::Result<BookingDto> {
 }
 
 fn fill_needs(conn: &Connection, mut b: BookingDto) -> rusqlite::Result<BookingDto> {
-    let mut stmt = conn.prepare("SELECT type_id, quantity FROM booking_needs WHERE booking_id = ?1 ORDER BY type_id")?;
-    b.needs = stmt.query_map([b.id], |r| Ok(NeedIn { type_id: r.get(0)?, quantity: r.get(1)? }))?.collect::<Result<_, _>>()?;
+    b.needs = db::load_lines(conn, "booking_needs", "booking_id", b.id)?;
     Ok(b)
 }
 
@@ -364,7 +368,6 @@ fn write_booking(tx: &Connection, id: Option<Id>, slot: &Slot, c: &Contact, b: &
                  nth=?13, until=?14, av_support=?15, public_title=?16, notes=?17, updated_at=?18 WHERE id = ?19",
                 args.as_slice(),
             )?;
-            tx.execute("DELETE FROM booking_needs WHERE booking_id = ?1", [id])?;
             let token: String = tx.query_row("SELECT token FROM bookings WHERE id = ?1", [id], |r| r.get(0))?;
             (id, token)
         }
@@ -382,9 +385,7 @@ fn write_booking(tx: &Connection, id: Option<Id>, slot: &Slot, c: &Contact, b: &
             (tx.last_insert_rowid(), token)
         }
     };
-    for (t, q) in &slot.needs {
-        tx.execute("INSERT INTO booking_needs(booking_id, type_id, quantity) VALUES (?1, ?2, ?3)", params![id, t, q])?;
-    }
+    db::save_lines(tx, "booking_needs", "booking_id", id, &slot.needs)?;
     Ok((id, token))
 }
 
@@ -450,14 +451,14 @@ fn competing_pending(conn: &Connection, booking_id: Id, room_id: Id, dates: &[Sp
 /// Approved equipment loans that this booking's equipment needs would leave
 /// short. Only meaningful while pending: once approved, the booking is a
 /// church event and the loan page itself warns.
-fn equipment_impact(conn: &Connection, room_id: Id, dates: &[Span], needs: &[(Id, i64)]) -> Result<Vec<Value>, ApiError> {
+fn equipment_impact(conn: &Connection, room_id: Id, dates: &[Span], needs: &[(Want, i64)]) -> Result<Vec<Value>, ApiError> {
     if needs.is_empty() || dates.is_empty() {
         return Ok(vec![]);
     }
     let settings = db::get_settings(conn)?;
     let now = now();
     let window = Span::new(dates[0].start, dates.iter().map(|d| d.end).max().unwrap_or(dates[0].end));
-    let needs: BTreeMap<Id, i64> = needs.iter().copied().collect();
+    let needs: BTreeMap<Want, i64> = needs.iter().copied().collect();
     let mut stmt = conn.prepare(
         "SELECT DISTINCT l.id, l.pickup_at, l.return_at, l.status, l.event_name, l.organiser_name
          FROM loans l JOIN loan_allocations a ON a.loan_id = l.id
@@ -491,15 +492,16 @@ fn equipment_impact(conn: &Connection, room_id: Id, dates: &[Span], needs: &[(Id
         for span in dates.iter().filter(|d| d.overlaps(&occupancy)) {
             world.occurrences.push(Occurrence { event_id: 0, group_id: None, room_id, span: *span, needs: needs.clone() });
         }
-        for (r, t, over) in engine::check_allocation(&world, occupancy, &alloc) {
-            let was = before.iter().find(|(br, bt, _)| *br == r && *bt == t).map_or(0, |b| b.2);
-            if over > was {
+        for p in engine::check_allocation(&world, occupancy, &alloc) {
+            let was = before.iter().find(|b| b.room_id == p.room_id && b.node == p.node).map_or(0, |b| b.over);
+            if p.over > was {
                 out.push(json!({
                     "loan_id": loan_id,
                     "loan_name": if event_name.is_empty() { organiser.clone() } else { event_name.clone() },
-                    "room_id": r,
-                    "type_id": t,
-                    "short_by": over - was,
+                    "room_id": p.room_id,
+                    "kind_id": p.node.kind_id(),
+                    "type_id": p.node.type_id(),
+                    "short_by": p.over - was,
                 }));
             }
         }
@@ -611,12 +613,8 @@ async fn approve(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, J
         ],
     )?;
     let event_id = tx.last_insert_rowid();
-    for n in &bk.needs {
-        tx.execute(
-            "INSERT INTO event_needs(event_id, type_id, quantity) VALUES (?1, ?2, ?3)",
-            params![event_id, n.type_id, n.quantity],
-        )?;
-    }
+    let needs: Vec<(Want, i64)> = bk.needs.iter().map(|n| (n.want, n.quantity)).collect();
+    db::save_lines(&tx, "event_needs", "event_id", event_id, &needs)?;
     let skipped = if b.skip_clashing && !b.force { check.clashes.len() } else { 0 };
     for c in check.clashes.iter().take(skipped) {
         tx.execute(
@@ -737,13 +735,13 @@ async fn detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> Api
     let check = check_clashes(&conn, bk.room_id, &bk.rule, bk.event_id)?;
     let pending = bk.status == "pending";
     let competing = if pending { competing_pending(&conn, id, bk.room_id, &check.dates)? } else { vec![] };
-    let needs: Vec<(Id, i64)> = bk.needs.iter().map(|n| (n.type_id, n.quantity)).collect();
+    let needs: Vec<(Want, i64)> = bk.needs.iter().map(|n| (n.want, n.quantity)).collect();
     let impact = if pending { equipment_impact(&conn, bk.room_id, &check.dates, &needs)? } else { vec![] };
     // Dates staff cancelled on the live event (e.g. skipped clashes, holidays).
     let cancelled_dates: Vec<NaiveDateTime> = match bk.event_id {
         Some(e) => db::load_overrides(&conn)?
             .into_iter()
-            .filter(|o| o.event_id == e && o.type_id.is_none())
+            .filter(|o| o.event_id == e && o.want().is_none())
             .map(|o| o.occurrence_start)
             .collect(),
         None => vec![],
@@ -767,23 +765,54 @@ async fn detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> Api
 struct PublicEquipment {
     type_id: Id,
     name: String,
-    category: String,
+    kind_id: Option<Id>,
+    quantity: i64,
+}
+
+#[derive(Serialize)]
+struct PublicKind {
+    id: Id,
+    name: String,
+    parent_id: Option<Id>,
+    requestable: bool,
+    sort_order: i64,
+    /// Units of all models below this kind in the room.
     quantity: i64,
 }
 
 async fn public_rooms(State(st): State<AppState>) -> ApiResult<Value> {
     let conn = st.conn();
+    let cat = db::load_catalog(&conn)?;
     let mut stmt = conn.prepare(
-        "SELECT s.room_id, t.id, t.name, t.category, s.quantity FROM stock s
-         JOIN equipment_types t ON t.id = s.type_id WHERE s.quantity > 0 ORDER BY t.category, t.name",
+        "SELECT s.room_id, t.id, t.name, t.kind_id, s.quantity FROM stock s
+         JOIN equipment_types t ON t.id = s.type_id WHERE s.quantity > 0 ORDER BY t.name",
     )?;
     let mut equipment: HashMap<Id, Vec<PublicEquipment>> = HashMap::new();
     for row in stmt.query_map([], |r| {
-        Ok((r.get::<_, Id>(0)?, PublicEquipment { type_id: r.get(1)?, name: r.get(2)?, category: r.get(3)?, quantity: r.get(4)? }))
+        Ok((r.get::<_, Id>(0)?, PublicEquipment { type_id: r.get(1)?, name: r.get(2)?, kind_id: r.get(3)?, quantity: r.get(4)? }))
     })? {
         let (room, e) = row?;
         equipment.entry(room).or_default().push(e);
     }
+    let all_kinds: Vec<(Id, String, Option<Id>, bool, i64)> = conn
+        .prepare("SELECT id, name, parent_id, requestable, sort_order FROM equipment_kinds ORDER BY sort_order, name")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<Result<_, _>>()?;
+    // The kinds above each room's models, with how many units sit below each.
+    let kinds_in = |models: &[PublicEquipment]| -> Vec<PublicKind> {
+        let mut qty: HashMap<Id, i64> = HashMap::new();
+        for m in models {
+            for k in cat.path(Want::Model(m.type_id)).into_iter().filter_map(Want::kind_id) {
+                *qty.entry(k).or_insert(0) += m.quantity;
+            }
+        }
+        let present: BTreeSet<Id> = qty.keys().copied().collect();
+        all_kinds
+            .iter()
+            .filter(|k| present.contains(&k.0))
+            .map(|k| PublicKind { id: k.0, name: k.1.clone(), parent_id: k.2, requestable: k.3, sort_order: k.4, quantity: qty[&k.0] })
+            .collect()
+    };
     let mut stmt =
         conn.prepare("SELECT id, name, capacity, public_notes FROM rooms WHERE bookable = 1 ORDER BY name")?;
     let rooms: Vec<Value> = stmt
@@ -791,8 +820,9 @@ async fn public_rooms(State(st): State<AppState>) -> ApiResult<Value> {
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .map(|(id, name, capacity, notes)| {
+            let models = equipment.remove(&id).unwrap_or_default();
             json!({ "id": id, "name": name, "capacity": capacity, "public_notes": notes,
-                    "equipment": equipment.remove(&id).unwrap_or_default() })
+                    "kinds": kinds_in(&models), "equipment": models })
         })
         .collect();
     Ok(Json(json!(rooms)))
@@ -861,7 +891,7 @@ async fn public_status(State(st): State<AppState>, Path(token): Path<String>) ->
     let cancelled_dates: Vec<NaiveDateTime> = match bk.event_id {
         Some(e) => db::load_overrides(&conn)?
             .into_iter()
-            .filter(|o| o.event_id == e && o.type_id.is_none())
+            .filter(|o| o.event_id == e && o.want().is_none())
             .map(|o| o.occurrence_start)
             .collect(),
         None => vec![],
@@ -879,7 +909,7 @@ async fn public_status(State(st): State<AppState>, Path(token): Path<String>) ->
         "repeats": rule.recurrence != Recurrence::None,
         "cancelled_dates": cancelled_dates,
         "needs": bk.needs.iter().map(|n| json!({
-            "name": refs.types.get(&n.type_id).map(|t| t.name.clone()).unwrap_or_default(),
+            "name": refs.want_name(n.want),
             "quantity": n.quantity,
         })).collect::<Vec<_>>(),
         "av_support": bk.av_support,

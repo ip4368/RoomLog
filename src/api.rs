@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::auth::{self, Role, Staff};
 use crate::bookings;
 use crate::db::{self, OccurrenceView, fmt_dt, parse_dt};
-use crate::engine::{self, Evaluation, Id};
+use crate::engine::{self, Catalog, Evaluation, Id, Line, Want};
 use crate::recurrence::{Recurrence, Span};
 
 const MAX_TEXT: usize = 4000;
@@ -244,7 +244,121 @@ async fn delete_room(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
     Ok(Json(json!({ "ok": true })))
 }
 
-// --------------------------------------------------------------- equipment
+// ------------------------------------------------------------------- kinds
+
+#[derive(Serialize, Deserialize)]
+struct KindDto {
+    #[serde(default)]
+    id: Id,
+    name: String,
+    #[serde(default)]
+    parent_id: Option<Id>,
+    #[serde(default = "yes")]
+    requestable: bool,
+    #[serde(default)]
+    sort_order: i64,
+    #[serde(default)]
+    notes: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn list_kind_rows(conn: &Connection) -> rusqlite::Result<Vec<KindDto>> {
+    let mut stmt =
+        conn.prepare("SELECT id, name, parent_id, requestable, sort_order, notes FROM equipment_kinds ORDER BY sort_order, name")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(KindDto {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            parent_id: r.get(2)?,
+            requestable: r.get(3)?,
+            sort_order: r.get(4)?,
+            notes: r.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+async fn list_kinds(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<KindDto>> {
+    Ok(Json(list_kind_rows(&st.conn())?))
+}
+
+fn kind_exists(conn: &Connection, id: Id) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT COUNT(*) FROM equipment_kinds WHERE id = ?1", [id], |r| r.get::<_, i64>(0)).map(|n| n > 0)
+}
+
+/// Validates a kind; `id` is set when updating (to refuse moving a kind
+/// under itself or one of its own sub-kinds).
+fn clean_kind(conn: &Connection, id: Option<Id>, b: &KindDto) -> Result<(String, String), ApiError> {
+    let name = required(&b.name, "Name")?;
+    let notes = clean(&b.notes, "Notes")?;
+    if let Some(p) = b.parent_id {
+        if !kind_exists(conn, p)? {
+            return Err(ApiError::bad("The parent kind doesn't exist"));
+        }
+        if let Some(id) = id {
+            let cat = db::load_catalog(conn)?;
+            if cat.path(Want::Kind(p)).contains(&Want::Kind(id)) {
+                return Err(ApiError::bad("A kind can't go inside itself or one of its own sub-kinds"));
+            }
+        }
+    }
+    Ok((name, notes))
+}
+
+async fn create_kind(staff: Staff, State(st): State<AppState>, Json(b): Json<KindDto>) -> ApiResult<KindDto> {
+    staff.require(Role::Av)?;
+    let conn = st.conn();
+    let (name, notes) = clean_kind(&conn, None, &b)?;
+    conn.execute(
+        "INSERT INTO equipment_kinds(name, parent_id, requestable, sort_order, notes) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![name, b.parent_id, b.requestable, b.sort_order, notes],
+    )?;
+    Ok(Json(KindDto { id: conn.last_insert_rowid(), name, notes, ..b }))
+}
+
+async fn update_kind(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<KindDto>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
+    let conn = st.conn();
+    let (name, notes) = clean_kind(&conn, Some(id), &b)?;
+    if conn.execute(
+        "UPDATE equipment_kinds SET name = ?1, parent_id = ?2, requestable = ?3, sort_order = ?4, notes = ?5 WHERE id = ?6",
+        params![name, b.parent_id, b.requestable, b.sort_order, notes, id],
+    )? == 0
+    {
+        return Err(ApiError::not_found());
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_kind(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
+    staff.require(Role::Av)?;
+    let conn = st.conn();
+    let count = |sql: &str| conn.query_row(sql, [id], |r| r.get::<_, i64>(0));
+    if count("SELECT (SELECT COUNT(*) FROM equipment_kinds WHERE parent_id = ?1) + (SELECT COUNT(*) FROM equipment_types WHERE kind_id = ?1)")? > 0 {
+        return Err(ApiError::conflict("This kind still has sub-kinds or models; move or delete them first", None));
+    }
+    if count(
+        "SELECT COUNT(*) FROM loan_items i JOIN loans l ON l.id = i.loan_id
+         WHERE i.kind_id = ?1 AND l.status IN ('pending','approved','collected')",
+    )? > 0
+        || count(
+            "SELECT COUNT(*) FROM booking_needs n JOIN bookings b ON b.id = n.booking_id
+             WHERE n.kind_id = ?1 AND b.status IN ('pending','approved')",
+        )? > 0
+    {
+        return Err(ApiError::conflict("Open loan requests or bookings ask for this kind; resolve those first", None));
+    }
+    if count("SELECT COUNT(*) FROM event_needs WHERE kind_id = ?1")? > 0 {
+        return Err(ApiError::conflict("Church events need this kind; change their equipment first", None));
+    }
+    conn.execute("DELETE FROM equipment_kinds WHERE id = ?1", [id])?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ------------------------------------------------------- equipment (models)
 
 #[derive(Serialize, Deserialize)]
 struct EquipmentDto {
@@ -252,7 +366,7 @@ struct EquipmentDto {
     id: Id,
     name: String,
     #[serde(default)]
-    category: String,
+    kind_id: Option<Id>,
     #[serde(default)]
     notes: String,
     #[serde(default = "yes")]
@@ -261,21 +375,17 @@ struct EquipmentDto {
     total: i64,
 }
 
-fn yes() -> bool {
-    true
-}
-
 fn list_equipment_rows(conn: &Connection) -> rusqlite::Result<Vec<EquipmentDto>> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.category, t.notes, t.lendable, COALESCE(SUM(s.quantity), 0)
+        "SELECT t.id, t.name, t.kind_id, t.notes, t.lendable, COALESCE(SUM(s.quantity), 0)
          FROM equipment_types t LEFT JOIN stock s ON s.type_id = t.id
-         GROUP BY t.id ORDER BY t.category, t.name",
+         GROUP BY t.id ORDER BY t.name",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(EquipmentDto {
             id: r.get(0)?,
             name: r.get(1)?,
-            category: r.get(2)?,
+            kind_id: r.get(2)?,
             notes: r.get(3)?,
             lendable: r.get(4)?,
             total: r.get(5)?,
@@ -288,15 +398,23 @@ async fn list_equipment(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<E
     Ok(Json(list_equipment_rows(&st.conn())?))
 }
 
+fn clean_equipment(conn: &Connection, b: &EquipmentDto) -> Result<(String, String), ApiError> {
+    if let Some(k) = b.kind_id
+        && !kind_exists(conn, k)? {
+            return Err(ApiError::bad("That kind doesn't exist"));
+        }
+    Ok((required(&b.name, "Name")?, clean(&b.notes, "Notes")?))
+}
+
 async fn create_equipment(staff: Staff, State(st): State<AppState>, Json(b): Json<EquipmentDto>) -> ApiResult<EquipmentDto> {
     staff.require(Role::Av)?;
     let conn = st.conn();
-    let (name, category, notes) = (required(&b.name, "Name")?, clean(&b.category, "Category")?, clean(&b.notes, "Notes")?);
+    let (name, notes) = clean_equipment(&conn, &b)?;
     conn.execute(
-        "INSERT INTO equipment_types(name, category, notes, lendable) VALUES (?1, ?2, ?3, ?4)",
-        params![name, category, notes, b.lendable],
+        "INSERT INTO equipment_types(name, kind_id, notes, lendable) VALUES (?1, ?2, ?3, ?4)",
+        params![name, b.kind_id, notes, b.lendable],
     )?;
-    Ok(Json(EquipmentDto { id: conn.last_insert_rowid(), name, category, notes, lendable: b.lendable, total: 0 }))
+    Ok(Json(EquipmentDto { id: conn.last_insert_rowid(), name, notes, total: 0, ..b }))
 }
 
 async fn update_equipment(
@@ -307,10 +425,10 @@ async fn update_equipment(
 ) -> ApiResult<Value> {
     staff.require(Role::Av)?;
     let conn = st.conn();
-    let (name, category, notes) = (required(&b.name, "Name")?, clean(&b.category, "Category")?, clean(&b.notes, "Notes")?);
+    let (name, notes) = clean_equipment(&conn, &b)?;
     if conn.execute(
-        "UPDATE equipment_types SET name = ?1, category = ?2, notes = ?3, lendable = ?4 WHERE id = ?5",
-        params![name, category, notes, b.lendable, id],
+        "UPDATE equipment_types SET name = ?1, kind_id = ?2, notes = ?3, lendable = ?4 WHERE id = ?5",
+        params![name, b.kind_id, notes, b.lendable, id],
     )? == 0
     {
         return Err(ApiError::not_found());
@@ -332,6 +450,56 @@ async fn delete_equipment(staff: Staff, State(st): State<AppState>, Path(id): Pa
     }
     conn.execute("DELETE FROM equipment_types WHERE id = ?1", [id])?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ------------------------------------------------------------ request lines
+
+/// Validates request lines (loan items, booking or event needs) and merges
+/// duplicates. Kinds must exist and be requestable; models must exist, and on
+/// public forms be lendable. `min_qty` is 0 for event needs (0 = remove).
+pub fn validate_lines(
+    conn: &Connection,
+    lines: &[Line],
+    public: bool,
+    min_qty: i64,
+) -> Result<BTreeMap<Want, i64>, ApiError> {
+    if lines.len() > MAX_ITEMS {
+        return Err(ApiError::bad("Too many equipment items"));
+    }
+    let mut merged: BTreeMap<Want, i64> = BTreeMap::new();
+    for l in lines {
+        if !(min_qty..=10_000).contains(&l.quantity) {
+            return Err(ApiError::bad(format!("Quantities must be between {min_qty} and 10000")));
+        }
+        match l.want {
+            Want::Model(t) => {
+                let lendable: Option<bool> = conn
+                    .query_row("SELECT lendable FROM equipment_types WHERE id = ?1", [t], |r| r.get(0))
+                    .optional()?;
+                match lendable {
+                    None => return Err(ApiError::bad("Unknown equipment type")),
+                    Some(false) if public => return Err(ApiError::bad("That equipment is not available for loan")),
+                    _ => {}
+                }
+            }
+            Want::Kind(k) => {
+                let kind: Option<(String, bool)> = conn
+                    .query_row("SELECT name, requestable FROM equipment_kinds WHERE id = ?1", [k], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                match kind {
+                    None => return Err(ApiError::bad("Unknown kind of equipment")),
+                    Some((name, false)) => {
+                        return Err(ApiError::bad(format!("Please choose something more specific than \"{name}\"")));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if l.quantity > 0 {
+            *merged.entry(l.want).or_insert(0) += l.quantity;
+        }
+    }
+    Ok(merged)
 }
 
 // ------------------------------------------------------------------- stock
@@ -448,12 +616,6 @@ async fn delete_group(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) 
 
 // ------------------------------------------------------------------ events
 
-#[derive(Serialize, Deserialize, Clone)]
-struct NeedDto {
-    type_id: Id,
-    quantity: i64,
-}
-
 #[derive(Serialize, Deserialize)]
 struct EventDto {
     #[serde(default)]
@@ -473,7 +635,7 @@ struct EventDto {
     #[serde(default)]
     notes: String,
     #[serde(default)]
-    needs: Vec<NeedDto>,
+    needs: Vec<Line>,
     #[serde(default)]
     description: String,
     /// Set (output only) when the event came from an approved room booking.
@@ -504,7 +666,7 @@ fn event_to_dto(e: &db::EventRow) -> EventDto {
         nth,
         until: e.rule.until.map(|u| u.format("%Y-%m-%d").to_string()),
         notes: e.notes.clone(),
-        needs: e.needs.iter().map(|(&type_id, &quantity)| NeedDto { type_id, quantity }).collect(),
+        needs: engine::to_lines(&e.needs),
         description: e.rule.describe(),
         booking_id: None,
     }
@@ -536,14 +698,16 @@ fn validate_event(b: &EventDto) -> Result<(), ApiError> {
     if let Some(u) = b.until.as_deref().filter(|u| !u.is_empty()) {
         NaiveDate::parse_from_str(u, "%Y-%m-%d").map_err(|_| ApiError::bad("'Until' date is invalid"))?;
     }
-    if b.needs.iter().any(|n| !(0..=10_000).contains(&n.quantity)) {
-        return Err(ApiError::bad("Quantities must be between 0 and 10000"));
+    let mut seen = HashSet::new();
+    if b.needs.iter().filter(|n| n.quantity > 0).any(|n| !seen.insert(n.want)) {
+        return Err(ApiError::bad("Each kind or model can only be listed once per event"));
     }
     Ok(())
 }
 
 fn save_event(conn: &mut Connection, id: Option<Id>, b: &EventDto) -> Result<Id, ApiError> {
     validate_event(b)?;
+    let needs: Vec<(Want, i64)> = validate_lines(conn, &b.needs, false, 0)?.into_iter().collect();
     let tx = conn.transaction()?;
     let until = b.until.clone().filter(|u| !u.is_empty());
     let title = b.title.trim().to_string();
@@ -575,7 +739,6 @@ fn save_event(conn: &mut Connection, id: Option<Id>, b: &EventDto) -> Result<Id,
             if n == 0 {
                 return Err(ApiError::not_found());
             }
-            tx.execute("DELETE FROM event_needs WHERE event_id = ?1", [id])?;
             id
         }
         None => {
@@ -587,16 +750,7 @@ fn save_event(conn: &mut Connection, id: Option<Id>, b: &EventDto) -> Result<Id,
             tx.last_insert_rowid()
         }
     };
-    let mut seen = HashSet::new();
-    for n in b.needs.iter().filter(|n| n.quantity > 0) {
-        if !seen.insert(n.type_id) {
-            return Err(ApiError::bad("Each equipment type can only be listed once per event"));
-        }
-        tx.execute(
-            "INSERT INTO event_needs(event_id, type_id, quantity) VALUES (?1, ?2, ?3)",
-            params![id, n.type_id, n.quantity],
-        )?;
-    }
+    db::save_lines(&tx, "event_needs", "event_id", id, &needs)?;
     tx.commit()?;
     Ok(id)
 }
@@ -632,7 +786,16 @@ async fn delete_event(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) 
 #[derive(Serialize)]
 pub struct TypeRef {
     pub name: String,
-    category: String,
+    pub kind_id: Option<Id>,
+    pub lendable: bool,
+}
+
+#[derive(Serialize)]
+pub struct KindRef {
+    pub name: String,
+    pub parent_id: Option<Id>,
+    pub requestable: bool,
+    pub sort_order: i64,
 }
 
 /// id -> display name lookups sent alongside API responses.
@@ -640,8 +803,22 @@ pub struct TypeRef {
 pub struct Refs {
     pub rooms: BTreeMap<Id, String>,
     pub types: BTreeMap<Id, TypeRef>,
+    pub kinds: BTreeMap<Id, KindRef>,
     groups: BTreeMap<Id, GroupDto>,
     events: BTreeMap<Id, String>,
+}
+
+impl Refs {
+    /// "Shure SM58", or "Wired vocal mic (any)" for any model of a kind.
+    pub fn want_name(&self, w: Want) -> String {
+        match w {
+            Want::Model(t) => self.types.get(&t).map_or_else(|| format!("#{t}"), |x| x.name.clone()),
+            Want::Kind(k) => self.kinds.get(&k).map_or_else(|| format!("#{k}"), |x| format!("{} (any)", x.name)),
+        }
+    }
+    pub fn type_name(&self, t: Id) -> String {
+        self.want_name(Want::Model(t))
+    }
 }
 
 pub fn load_refs(conn: &Connection) -> rusqlite::Result<Refs> {
@@ -652,11 +829,13 @@ pub fn load_refs(conn: &Connection) -> rusqlite::Result<Refs> {
         rooms.insert(id, n);
     }
     let mut types = BTreeMap::new();
-    let mut stmt = conn.prepare("SELECT id, name, category FROM equipment_types")?;
-    for r in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-        let (id, name, category) = r?;
-        types.insert(id, TypeRef { name, category });
+    for t in list_equipment_rows(conn)? {
+        types.insert(t.id, TypeRef { name: t.name, kind_id: t.kind_id, lendable: t.lendable });
     }
+    let kinds = list_kind_rows(conn)?
+        .into_iter()
+        .map(|k| (k.id, KindRef { name: k.name, parent_id: k.parent_id, requestable: k.requestable, sort_order: k.sort_order }))
+        .collect();
     let groups = list_group_rows(conn)?.into_iter().map(|g| (g.id, g)).collect();
     let mut events = BTreeMap::new();
     let mut stmt = conn.prepare("SELECT id, title FROM events")?;
@@ -664,7 +843,7 @@ pub fn load_refs(conn: &Connection) -> rusqlite::Result<Refs> {
         let (id, n) = r?;
         events.insert(id, n);
     }
-    Ok(Refs { rooms, types, groups, events })
+    Ok(Refs { rooms, types, kinds, groups, events })
 }
 
 // ---------------------------------------------------------------- schedule
@@ -695,6 +874,10 @@ async fn schedule(_: Staff, State(st): State<AppState>, Query(q): Query<Schedule
 struct OverrideIn {
     event_id: Id,
     occurrence_start: String,
+    /// Both unset: cancel the occurrence. Otherwise the need being reduced.
+    #[serde(default)]
+    kind_id: Option<Id>,
+    #[serde(default)]
     type_id: Option<Id>,
     #[serde(default)]
     quantity: i64,
@@ -704,7 +887,10 @@ struct OverrideIn {
 }
 
 async fn create_override(staff: Staff, State(st): State<AppState>, Json(b): Json<OverrideIn>) -> ApiResult<Value> {
-    if b.type_id.is_some() {
+    if b.kind_id.is_some() && b.type_id.is_some() {
+        return Err(ApiError::bad("An override reduces either a kind or a model, not both"));
+    }
+    if b.kind_id.is_some() || b.type_id.is_some() {
         staff.require(Role::Av)?;
     }
     let start = parse_dt(&b.occurrence_start).ok_or_else(|| ApiError::bad("Invalid occurrence start"))?;
@@ -720,13 +906,14 @@ async fn create_override(staff: Staff, State(st): State<AppState>, Json(b): Json
     }
     let start_s = fmt_dt(start);
     conn.execute(
-        "DELETE FROM occurrence_overrides WHERE event_id = ?1 AND occurrence_start = ?2 AND type_id IS ?3",
-        params![b.event_id, start_s, b.type_id],
+        "DELETE FROM occurrence_overrides
+         WHERE event_id = ?1 AND occurrence_start = ?2 AND type_id IS ?3 AND kind_id IS ?4",
+        params![b.event_id, start_s, b.type_id, b.kind_id],
     )?;
     conn.execute(
-        "INSERT INTO occurrence_overrides(event_id, occurrence_start, type_id, quantity, note, loan_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![b.event_id, start_s, b.type_id, b.quantity, clean(&b.note, "Note")?, b.loan_id, fmt_dt(now())],
+        "INSERT INTO occurrence_overrides(event_id, occurrence_start, kind_id, type_id, quantity, note, loan_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![b.event_id, start_s, b.kind_id, b.type_id, b.quantity, clean(&b.note, "Note")?, b.loan_id, fmt_dt(now())],
     )?;
     Ok(Json(json!({ "id": conn.last_insert_rowid() })))
 }
@@ -734,7 +921,11 @@ async fn create_override(staff: Staff, State(st): State<AppState>, Json(b): Json
 async fn delete_override(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
     let conn = st.conn();
     let is_equipment: Option<bool> = conn
-        .query_row("SELECT type_id IS NOT NULL FROM occurrence_overrides WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT type_id IS NOT NULL OR kind_id IS NOT NULL FROM occurrence_overrides WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .optional()?;
     if is_equipment == Some(true) {
         staff.require(Role::Av)?;
@@ -745,10 +936,9 @@ async fn delete_override(staff: Staff, State(st): State<AppState>, Path(id): Pat
 
 // ------------------------------------------------------------------- loans
 
-#[derive(Deserialize, Clone)]
-pub struct ItemIn {
-    type_id: Id,
-    quantity: i64,
+/// Could two lines end up wanting the same physical units?
+fn wants_overlap(cat: &Catalog, a: Want, b: Want) -> bool {
+    cat.is_under(a, b) || cat.is_under(b, a)
 }
 
 #[derive(Deserialize)]
@@ -769,13 +959,7 @@ pub struct LoanIn {
     return_at: String,
     #[serde(default)]
     notes: String,
-    items: Vec<ItemIn>,
-}
-
-#[derive(Serialize, Clone)]
-struct ItemDto {
-    type_id: Id,
-    quantity: i64,
+    items: Vec<Line>,
 }
 
 #[derive(Serialize, Clone)]
@@ -804,7 +988,7 @@ struct LoanDto {
     decided_by: String,
     created_at: NaiveDateTime,
     updated_at: NaiveDateTime,
-    items: Vec<ItemDto>,
+    items: Vec<Line>,
     allocations: Vec<AllocDto>,
 }
 
@@ -837,10 +1021,7 @@ fn row_to_loan(r: &rusqlite::Row) -> rusqlite::Result<LoanDto> {
 }
 
 fn fill_loan(conn: &Connection, mut l: LoanDto) -> rusqlite::Result<LoanDto> {
-    let mut stmt = conn.prepare("SELECT type_id, quantity FROM loan_items WHERE loan_id = ?1 ORDER BY type_id")?;
-    l.items = stmt
-        .query_map([l.id], |r| Ok(ItemDto { type_id: r.get(0)?, quantity: r.get(1)? }))?
-        .collect::<Result<_, _>>()?;
+    l.items = db::load_lines(conn, "loan_items", "loan_id", l.id)?;
     let mut stmt = conn.prepare(
         "SELECT room_id, type_id, quantity FROM loan_allocations WHERE loan_id = ?1 ORDER BY room_id, type_id",
     )?;
@@ -929,10 +1110,10 @@ async fn list_loans(_: Staff, State(st): State<AppState>, Query(q): Query<LoanQu
 struct ValidLoan {
     pickup: NaiveDateTime,
     ret: NaiveDateTime,
-    items: Vec<(Id, i64)>,
+    items: Vec<(Want, i64)>,
 }
 
-fn validate_request_core(conn: &Connection, pickup: &str, ret: &str, items: &[ItemIn], public: bool) -> Result<ValidLoan, ApiError> {
+fn validate_request_core(conn: &Connection, pickup: &str, ret: &str, items: &[Line], public: bool) -> Result<ValidLoan, ApiError> {
     let pickup = parse_dt(pickup).ok_or_else(|| ApiError::bad("Pickup date/time is invalid"))?;
     let ret = parse_dt(ret).ok_or_else(|| ApiError::bad("Return date/time is invalid"))?;
     if ret <= pickup {
@@ -944,21 +1125,7 @@ fn validate_request_core(conn: &Connection, pickup: &str, ret: &str, items: &[It
     if items.is_empty() || items.len() > MAX_ITEMS {
         return Err(ApiError::bad("Please request at least one item"));
     }
-    let mut merged: BTreeMap<Id, i64> = BTreeMap::new();
-    for i in items {
-        if !(1..=10_000).contains(&i.quantity) {
-            return Err(ApiError::bad("Quantities must be at least 1"));
-        }
-        let lendable: Option<bool> = conn
-            .query_row("SELECT lendable FROM equipment_types WHERE id = ?1", [i.type_id], |r| r.get(0))
-            .optional()?;
-        match lendable {
-            None => return Err(ApiError::bad("Unknown equipment type")),
-            Some(false) if public => return Err(ApiError::bad("That equipment is not available for loan")),
-            _ => {}
-        }
-        *merged.entry(i.type_id).or_insert(0) += i.quantity;
-    }
+    let merged = validate_lines(conn, items, public, 1)?;
     Ok(ValidLoan { pickup, ret, items: merged.into_iter().collect() })
 }
 
@@ -1000,9 +1167,7 @@ fn insert_loan(conn: &mut Connection, b: &LoanIn, public: bool) -> Result<(Id, S
         ],
     )?;
     let id = tx.last_insert_rowid();
-    for (t, q) in &v.items {
-        tx.execute("INSERT INTO loan_items(loan_id, type_id, quantity) VALUES (?1, ?2, ?3)", params![id, t, q])?;
-    }
+    db::save_lines(&tx, "loan_items", "loan_id", id, &v.items)?;
     tx.commit()?;
     Ok((id, token, v))
 }
@@ -1010,7 +1175,8 @@ fn insert_loan(conn: &mut Connection, b: &LoanIn, public: bool) -> Result<(Id, S
 /// What organisers see: availability per item, no contact or room detail.
 #[derive(Serialize)]
 struct PublicItem {
-    type_id: Id,
+    #[serde(flatten)]
+    want: Want,
     name: String,
     requested: i64,
     available: i64,
@@ -1030,8 +1196,8 @@ fn public_check(conn: &Connection, ev: &Evaluation) -> rusqlite::Result<PublicCh
             .items
             .iter()
             .map(|i| PublicItem {
-                type_id: i.type_id,
-                name: refs.types.get(&i.type_id).map(|t| t.name.clone()).unwrap_or_default(),
+                want: i.want,
+                name: refs.want_name(i.want),
                 requested: i.requested,
                 available: i.available,
             })
@@ -1052,28 +1218,28 @@ async fn loan_detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
     let now = now();
     let window = db::loan_occupancy(loan.pickup_at, loan.return_at, &loan.status, s.buffer_hours, now);
     let world = db::load_world(&conn, &window, Some(id), s.buffer_hours, now)?;
-    let items: Vec<(Id, i64)> = loan.items.iter().map(|i| (i.type_id, i.quantity)).collect();
+    let items: Vec<(Want, i64)> = loan.items.iter().map(|i| (i.want, i.quantity)).collect();
 
     let evaluation = (loan.status == "pending").then(|| engine::evaluate(&world, window, &items));
-    let problems: Vec<AllocDto> = if db::COMMITTED.contains(&loan.status.as_str()) {
+    let problems: Vec<engine::Problem> = if db::COMMITTED.contains(&loan.status.as_str()) {
         let alloc: Vec<(Id, Id, i64)> = loan.allocations.iter().map(|a| (a.room_id, a.type_id, a.quantity)).collect();
         engine::check_allocation(&world, window, &alloc)
-            .into_iter()
-            .map(|(room_id, type_id, quantity)| AllocDto { room_id, type_id, quantity })
-            .collect()
     } else {
         vec![]
     };
+    // Which allocated models serve which requested line.
+    let picks: Vec<engine::Pick> =
+        loan.allocations.iter().map(|a| engine::Pick { room_id: a.room_id, type_id: a.type_id, qty: a.quantity }).collect();
+    let given = engine::match_allocation(&world.catalog, &items, &picks);
 
     // Other pending requests competing for the same equipment in the same period.
-    let type_ids: HashSet<Id> = items.iter().map(|i| i.0).collect();
     let mut competing = Vec::new();
     for other in loans_overlapping(&conn, &window)? {
         if other.id == id || other.status != "pending" {
             continue;
         }
         let ol = get_loan(&conn, other.id)?;
-        if ol.items.iter().any(|i| type_ids.contains(&i.type_id)) {
+        if ol.items.iter().any(|o| items.iter().any(|(w, _)| wants_overlap(&world.catalog, o.want, *w))) {
             competing.push(other);
         }
     }
@@ -1084,6 +1250,7 @@ async fn loan_detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
         "loan": loan,
         "evaluation": evaluation,
         "allocation_problems": problems,
+        "given": given,
         "competing_pending": competing,
         "agreed_overrides": overrides,
         "buffer_hours": s.buffer_hours,
@@ -1097,7 +1264,7 @@ struct LoanPatch {
     message_to_organiser: Option<String>,
     pickup_at: Option<String>,
     return_at: Option<String>,
-    items: Option<Vec<ItemIn>>,
+    items: Option<Vec<Line>>,
 }
 
 async fn patch_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<LoanPatch>) -> ApiResult<Value> {
@@ -1119,9 +1286,7 @@ async fn patch_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>
         if loan.status != "pending" {
             return Err(ApiError::conflict("Dates and items can only be changed while the request is pending", None));
         }
-        let items: Vec<ItemIn> = b.items.clone().unwrap_or_else(|| {
-            loan.items.iter().map(|i| ItemIn { type_id: i.type_id, quantity: i.quantity }).collect()
-        });
+        let items: Vec<Line> = b.items.clone().unwrap_or_else(|| loan.items.clone());
         let v = validate_request_core(
             &tx,
             b.pickup_at.as_deref().unwrap_or(&fmt_dt(loan.pickup_at)),
@@ -1133,10 +1298,7 @@ async fn patch_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>
             "UPDATE loans SET pickup_at = ?1, return_at = ?2, updated_at = ?3 WHERE id = ?4",
             params![fmt_dt(v.pickup), fmt_dt(v.ret), ts, id],
         )?;
-        tx.execute("DELETE FROM loan_items WHERE loan_id = ?1", [id])?;
-        for (t, q) in &v.items {
-            tx.execute("INSERT INTO loan_items(loan_id, type_id, quantity) VALUES (?1, ?2, ?3)", params![id, t, q])?;
-        }
+        db::save_lines(&tx, "loan_items", "loan_id", id, &v.items)?;
     }
     tx.commit()?;
     Ok(Json(json!({ "ok": true })))
@@ -1178,15 +1340,25 @@ async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<I
             merged.into_iter().map(|((r, t), q)| (r, t, q)).collect()
         }
         None => {
-            let items: Vec<(Id, i64)> = loan.items.iter().map(|i| (i.type_id, i.quantity)).collect();
+            let items: Vec<(Want, i64)> = loan.items.iter().map(|i| (i.want, i.quantity)).collect();
             let ev = engine::evaluate(&world, window, &items);
             if !ev.fully_available && !b.force {
+                let short: Vec<Value> = ev
+                    .items
+                    .iter()
+                    .filter(|i| i.shortfall > 0)
+                    .map(|i| json!({ "kind_id": i.want.kind_id(), "type_id": i.want.type_id(), "shortfall": i.shortfall }))
+                    .collect();
                 return Err(ApiError::conflict(
                     "Not everything requested is available. Approve a partial loan, or resolve the shortage first.",
-                    Some(json!({ "shortfall": ev.items.iter().filter(|i| i.shortfall > 0).map(|i| json!({"type_id": i.type_id, "shortfall": i.shortfall})).collect::<Vec<_>>() })),
+                    Some(json!({ "shortfall": short })),
                 ));
             }
-            ev.items.iter().flat_map(|i| i.allocation.iter().map(move |a| (a.room_id, i.type_id, a.qty))).collect()
+            let mut merged: BTreeMap<(Id, Id), i64> = BTreeMap::new();
+            for p in ev.items.iter().flat_map(|i| &i.allocation) {
+                *merged.entry((p.room_id, p.type_id)).or_insert(0) += p.qty;
+            }
+            merged.into_iter().map(|((r, t), q)| (r, t, q)).collect()
         }
     };
     if allocations.is_empty() {
@@ -1196,7 +1368,7 @@ async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<I
     if !problems.is_empty() && !b.force {
         return Err(ApiError::conflict(
             "Some rooms can't spare that many during this period",
-            Some(json!(problems.iter().map(|(r, t, q)| json!({"room_id": r, "type_id": t, "over_by": q})).collect::<Vec<_>>())),
+            Some(json!(problems)),
         ));
     }
 
@@ -1282,7 +1454,7 @@ async fn delete_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id
 struct CheckIn {
     pickup_at: String,
     return_at: String,
-    items: Vec<ItemIn>,
+    items: Vec<Line>,
 }
 
 async fn admin_check(_: Staff, State(st): State<AppState>, Json(b): Json<CheckIn>) -> ApiResult<Value> {
@@ -1299,14 +1471,28 @@ async fn public_info(State(st): State<AppState>) -> ApiResult<Value> {
     Ok(Json(json!({ "church_name": s.church_name })))
 }
 
+/// What organisers can ask for: lendable models with stock, and the kinds
+/// above them (so they can ask for "any" at a requestable level).
 async fn public_catalog(State(st): State<AppState>) -> ApiResult<Value> {
     let conn = st.conn();
-    let items: Vec<Value> = list_equipment_rows(&conn)?
-        .into_iter()
-        .filter(|e| e.lendable && e.total > 0)
-        .map(|e| json!({ "id": e.id, "name": e.name, "category": e.category, "notes": e.notes }))
+    let cat = db::load_catalog(&conn)?;
+    let models: Vec<EquipmentDto> = list_equipment_rows(&conn)?.into_iter().filter(|e| e.lendable && e.total > 0).collect();
+    let used: HashSet<Id> = models
+        .iter()
+        .flat_map(|m| cat.path(Want::Model(m.id)))
+        .filter_map(Want::kind_id)
         .collect();
-    Ok(Json(json!(items)))
+    let kinds: Vec<Value> = list_kind_rows(&conn)?
+        .into_iter()
+        .filter(|k| used.contains(&k.id))
+        .map(|k| json!({ "id": k.id, "name": k.name, "parent_id": k.parent_id, "requestable": k.requestable,
+                         "sort_order": k.sort_order, "notes": k.notes }))
+        .collect();
+    let models: Vec<Value> = models
+        .into_iter()
+        .map(|e| json!({ "id": e.id, "name": e.name, "kind_id": e.kind_id, "notes": e.notes }))
+        .collect();
+    Ok(Json(json!({ "kinds": kinds, "models": models })))
 }
 
 async fn public_check_handler(State(st): State<AppState>, Json(b): Json<CheckIn>) -> ApiResult<PublicCheck> {
@@ -1327,19 +1513,35 @@ async fn public_status(State(st): State<AppState>, Path(token): Path<String>) ->
     let conn = st.conn();
     let loan = get_loan_by_token(&conn, &token)?;
     let refs = load_refs(&conn)?;
-    let type_name = |t: Id| refs.types.get(&t).map(|x| x.name.clone()).unwrap_or_default();
+    // Collection list (which room to collect from) once approved.
+    let show_collection = matches!(loan.status.as_str(), "approved" | "collected" | "returned");
+    let lines: Vec<(Want, i64)> = loan.items.iter().map(|i| (i.want, i.quantity)).collect();
+    let picks: Vec<engine::Pick> =
+        loan.allocations.iter().map(|a| engine::Pick { room_id: a.room_id, type_id: a.type_id, qty: a.quantity }).collect();
+    let given = engine::match_allocation(&db::load_catalog(&conn)?, &lines, &picks);
     let items: Vec<Value> = loan
         .items
         .iter()
-        .map(|i| json!({ "name": type_name(i.type_id), "quantity": i.quantity }))
+        .zip(&given)
+        .map(|(i, g)| {
+            // For "any of a kind", say which models they're getting.
+            let models: BTreeMap<String, i64> = g.iter().fold(BTreeMap::new(), |mut m, p| {
+                *m.entry(refs.type_name(p.type_id)).or_insert(0) += p.qty;
+                m
+            });
+            let given: Vec<Value> = if show_collection && matches!(i.want, Want::Kind(_)) {
+                models.into_iter().map(|(name, quantity)| json!({ "name": name, "quantity": quantity })).collect()
+            } else {
+                vec![]
+            };
+            json!({ "name": refs.want_name(i.want), "quantity": i.quantity, "given": given })
+        })
         .collect();
-    // Collection list (which room to collect from) once approved.
-    let show_collection = matches!(loan.status.as_str(), "approved" | "collected" | "returned");
     let mut by_room: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     if show_collection {
         for a in &loan.allocations {
             let room = refs.rooms.get(&a.room_id).cloned().unwrap_or_default();
-            by_room.entry(room).or_default().push(json!({ "name": type_name(a.type_id), "quantity": a.quantity }));
+            by_room.entry(room).or_default().push(json!({ "name": refs.type_name(a.type_id), "quantity": a.quantity }));
         }
     }
     let collection: Vec<Value> = by_room.into_iter().map(|(room, items)| json!({ "room": room, "items": items })).collect();
@@ -1375,6 +1577,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/rooms/{id}", put(update_room).delete(delete_room))
+        .route("/api/kinds", get(list_kinds).post(create_kind))
+        .route("/api/kinds/{id}", put(update_kind).delete(delete_kind))
         .route("/api/equipment", get(list_equipment).post(create_equipment))
         .route("/api/equipment/{id}", put(update_equipment).delete(delete_equipment))
         .route("/api/stock", get(list_stock).put(put_stock))

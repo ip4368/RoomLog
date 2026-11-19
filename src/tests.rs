@@ -132,7 +132,7 @@ async fn full_loan_workflow_with_negotiation() {
 
     // Non-lendable equipment is hidden from the public catalog and rejected.
     let catalog = c.ok("GET", "/api/public/catalog", None).await;
-    assert_eq!(catalog.as_array().unwrap().len(), 1);
+    assert_eq!(catalog["models"].as_array().unwrap().len(), 1);
 
     let sat = sunday - Duration::days(1);
     let pickup = format!("{}T10:00", sat.format("%Y-%m-%d"));
@@ -659,4 +659,179 @@ async fn room_booking_workflow() {
     let detail = office.ok("GET", &format!("/api/bookings/{wedding}"), None).await;
     assert_eq!(detail["equipment_impact"][0]["loan_id"], loan);
     assert_eq!(detail["equipment_impact"][0]["short_by"], 2);
+}
+
+#[test]
+fn migration_3_turns_categories_into_kinds_and_keeps_everything() {
+    let path = std::env::temp_dir().join(format!("roomlog-migrate3-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = db::open_at_version(path.to_str().unwrap(), 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO rooms(id, name) VALUES (1, 'Hall');
+             INSERT INTO equipment_types(id, name, category) VALUES (1, 'SM58', 'Mics'), (2, 'e835', ' Mics '), (3, 'Odd', '');
+             INSERT INTO stock VALUES (1, 1, 6), (1, 2, 2), (1, 3, 1);
+             INSERT INTO events(id, title, room_id, start_date, start_time, duration_minutes, recurrence)
+                 VALUES (1, 'Service', 1, '2026-01-04', '09:00', 60, 'weekly');
+             INSERT INTO event_needs VALUES (1, 1, 5);
+             INSERT INTO loans(id, token, status, organiser_name, pickup_at, return_at, created_at, updated_at)
+                 VALUES (1, 't', 'approved', 'Pat', '2026-01-10T10:00:00', '2026-01-11T10:00:00', 'x', 'x');
+             INSERT INTO loan_items VALUES (1, 2, 2);
+             INSERT INTO loan_allocations VALUES (1, 1, 2, 2);
+             INSERT INTO occurrence_overrides(event_id, occurrence_start, type_id, quantity, created_at)
+                 VALUES (1, '2026-01-11T09:00:00', 1, 3, 'x'), (1, '2026-01-18T09:00:00', NULL, 0, 'x');
+             INSERT INTO bookings(id, token, status, room_id, title, organiser_name, start_date, start_time,
+                 duration_minutes, recurrence, created_at, updated_at)
+                 VALUES (1, 'b', 'pending', 1, 'Party', 'Robin', '2026-02-01', '10:00', 60, 'none', 'x', 'x');
+             INSERT INTO booking_needs VALUES (1, 1, 2);",
+        )
+        .unwrap();
+    }
+    let conn = db::open(path.to_str().unwrap()).unwrap();
+    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    // One not-requestable kind per distinct (trimmed) category.
+    assert_eq!(count("SELECT COUNT(*) FROM equipment_kinds WHERE name = 'Mics' AND requestable = 0"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM equipment_kinds"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM equipment_types WHERE kind_id IS NOT NULL"), 2);
+    assert_eq!(count("SELECT kind_id IS NULL FROM equipment_types WHERE id = 3"), 1);
+    let has_category = conn.prepare("SELECT category FROM equipment_types").is_ok();
+    assert!(!has_category, "category column is dropped");
+    // Nothing was cascade-deleted, and existing lines are exact-model lines.
+    assert_eq!(count("SELECT COUNT(*) FROM stock"), 3);
+    assert_eq!(count("SELECT COUNT(*) FROM loan_allocations"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM event_needs WHERE type_id = 1 AND kind_id IS NULL AND quantity = 5"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM loan_items WHERE type_id = 2 AND quantity = 2"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM booking_needs WHERE type_id = 1 AND quantity = 2"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM occurrence_overrides WHERE kind_id IS NULL"), 2);
+    let events = db::load_events(&conn).unwrap();
+    assert_eq!(events[0].needs.get(&crate::engine::Want::Model(1)), Some(&5));
+    let fk: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+    assert_eq!(fk, 0);
+    drop(conn);
+    db::open(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn equipment_kinds_workflow() {
+    let mut c = Client::new();
+    c.login_admin().await;
+    let id = |v: Value| v["id"].as_i64().unwrap();
+    let hall = id(c.ok("POST", "/api/rooms", Some(json!({"name": "Main Hall"}))).await);
+    let youth = id(c.ok("POST", "/api/rooms", Some(json!({"name": "Youth Room"}))).await);
+
+    // Microphones > Vocal mic > Wired vocal mic; Cables is only a heading.
+    let mics = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Microphones"}))).await);
+    let vocal = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Vocal mic", "parent_id": mics}))).await);
+    let wired = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Wired vocal mic", "parent_id": vocal}))).await);
+    let cables = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Cables", "requestable": false}))).await);
+    let (s, _) = c.call("POST", "/api/kinds", Some(json!({"name": "Vocal mic"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "kind names are unique");
+    let (s, _) = c.call("PUT", &format!("/api/kinds/{mics}"), Some(json!({"name": "Microphones", "parent_id": wired}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "no cycles");
+
+    let sm58 = id(c.ok("POST", "/api/equipment", Some(json!({"name": "SM58", "kind_id": wired}))).await);
+    let e835 = id(c.ok("POST", "/api/equipment", Some(json!({"name": "e835", "kind_id": wired}))).await);
+    let xlr = id(c.ok("POST", "/api/equipment", Some(json!({"name": "XLR", "kind_id": cables}))).await);
+    for (room, t, q) in [(hall, sm58, 3), (hall, e835, 2), (youth, sm58, 1), (hall, xlr, 4)] {
+        c.ok("PUT", "/api/stock", Some(json!({"room_id": room, "type_id": t, "quantity": q}))).await;
+    }
+    let sunday = next_sunday();
+    let event = id(c
+        .ok(
+            "POST",
+            "/api/events",
+            Some(json!({
+                "title": "Service", "room_id": hall, "group_id": null,
+                "start_date": sunday.to_string(), "start_time": "09:00", "duration_minutes": 180,
+                "recurrence": "weekly", "needs": [{"kind_id": wired, "quantity": 4}]
+            })),
+        )
+        .await);
+    let events = c.ok("GET", "/api/events", None).await;
+    assert_eq!(events[0]["needs"][0], json!({"kind_id": wired, "type_id": null, "quantity": 4}));
+
+    let catalog = c.ok("GET", "/api/public/catalog", None).await;
+    assert_eq!(catalog["kinds"].as_array().unwrap().len(), 4);
+    assert_eq!(catalog["models"].as_array().unwrap().len(), 3);
+
+    // Not-requestable kinds are refused; unknown shapes too.
+    let weekday = (at(sunday + Duration::days(2), "10:00"), at(sunday + Duration::days(3), "10:00"));
+    let check = |items: Value| json!({"pickup_at": weekday.0, "return_at": weekday.1, "items": items});
+    let (s, _) = c.call("POST", "/api/public/check", Some(check(json!([{"kind_id": cables, "quantity": 1}])))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = c.call("POST", "/api/public/check", Some(check(json!([{"kind_id": vocal, "type_id": sm58, "quantity": 1}])))).await;
+    assert!(s.is_client_error());
+
+    // Midweek all 6 wired mics are free; over Sunday the service keeps 4 of the hall's 5.
+    let v = c.ok("POST", "/api/public/check", Some(check(json!([{"kind_id": vocal, "quantity": 6}])))).await;
+    assert_eq!(v["fully_available"], true);
+    assert_eq!(v["items"][0]["name"], "Vocal mic (any)");
+    let weekend = (at(sunday - Duration::days(1), "10:00"), at(sunday, "20:00"));
+    let created = c
+        .ok(
+            "POST",
+            "/api/public/requests",
+            Some(json!({
+                "organiser_name": "Pat", "email": "pat@example.org",
+                "pickup_at": weekend.0, "return_at": weekend.1, "items": [{"kind_id": vocal, "quantity": 3}]
+            })),
+        )
+        .await;
+    assert_eq!(created["check"]["items"][0]["available"], 2);
+    let token = created["token"].as_str().unwrap().to_string();
+    let loan_id = c.ok("GET", "/api/loans?status=pending", None).await[0]["id"].as_i64().unwrap();
+    let detail = c.ok("GET", &format!("/api/loans/{loan_id}"), None).await;
+    let item = &detail["evaluation"]["items"][0];
+    assert_eq!(item["kind_id"], vocal);
+    assert_eq!(item["shortfall"], 1);
+    let ask = &item["resolutions"][0]["asks"][0];
+    assert_eq!((ask["kind_id"].as_i64(), ask["normally"].as_i64(), ask["reduce_to"].as_i64()), (Some(wired), Some(4), Some(3)));
+    assert_eq!(detail["refs"]["kinds"][wired.to_string()]["name"], "Wired vocal mic");
+
+    // The service agrees to manage with 3 wired mics; now it all fits.
+    c.ok(
+        "POST",
+        "/api/overrides",
+        Some(json!({"event_id": event, "occurrence_start": ask["start"], "kind_id": wired, "quantity": 3, "loan_id": loan_id})),
+    )
+    .await;
+    let detail = c.ok("GET", &format!("/api/loans/{loan_id}"), None).await;
+    assert_eq!(detail["evaluation"]["fully_available"], true, "{}", detail["evaluation"]);
+    c.ok("POST", &format!("/api/loans/{loan_id}/approve"), Some(json!({}))).await;
+    let status = c.ok("GET", &format!("/api/public/requests/{token}"), None).await;
+    let given: i64 = status["items"][0]["given"].as_array().unwrap().iter().map(|g| g["quantity"].as_i64().unwrap()).sum();
+    assert_eq!(given, 3, "{status}");
+    assert_eq!(status["items"][0]["name"], "Vocal mic (any)");
+
+    // Kinds in use can't be deleted.
+    let (s, _) = c.call("DELETE", &format!("/api/kinds/{wired}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "still has models");
+    let spare = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Spare", "parent_id": mics}))).await);
+    c.ok("PUT", &format!("/api/events/{event}"), Some(json!({
+        "title": "Service", "room_id": hall, "group_id": null,
+        "start_date": sunday.to_string(), "start_time": "09:00", "duration_minutes": 180,
+        "recurrence": "weekly", "needs": [{"kind_id": spare, "quantity": 0}, {"kind_id": vocal, "quantity": 1}]
+    }))).await;
+    c.ok("DELETE", &format!("/api/kinds/{spare}"), None).await;
+
+    // Booking needs must fit the room together, at every level of the tree.
+    let booking = |needs: Value| {
+        json!({
+            "room_id": hall, "title": "Party", "organiser_name": "Robin", "email": "r@example.org",
+            "start_at": at(sunday + Duration::days(4), "18:00"), "end_at": at(sunday + Duration::days(4), "21:00"),
+            "needs": needs
+        })
+    };
+    let (s, v) = c.call("POST", "/api/public/bookings/check", Some(booking(json!([{"kind_id": vocal, "quantity": 6}])))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("only has 5"), "{v}");
+    let (s, _) = c
+        .call("POST", "/api/public/bookings/check", Some(booking(json!([{"kind_id": vocal, "quantity": 2}, {"type_id": e835, "quantity": 2}]))))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = c
+        .call("POST", "/api/public/bookings/check", Some(booking(json!([{"kind_id": vocal, "quantity": 4}, {"type_id": e835, "quantity": 2}]))))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "4 any + 2 e835 is more than the 5 vocal mics");
 }

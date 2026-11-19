@@ -23,10 +23,36 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             params![name, bookable, capacity, public_notes],
         )?;
     }
+    // The equipment tree: (kind, parent, requestable as "any"). Headings like
+    // "Cables" aren't requestable: a DI box is no substitute for an XLR cable.
+    let kinds = [
+        ("Microphones", None, true),
+        ("Vocal mic", Some("Microphones"), true),
+        ("Wired vocal mic", Some("Vocal mic"), true),
+        ("Wireless vocal mic", Some("Vocal mic"), true),
+        ("Lapel mic", Some("Microphones"), true),
+        ("Stands", None, false),
+        ("Cables", None, false),
+        ("Speakers", None, true),
+        ("Mixing", None, true),
+        ("Video", None, false),
+    ];
+    for (i, (n, parent, requestable)) in kinds.into_iter().enumerate() {
+        let parent: Option<i64> = match parent {
+            Some(p) => Some(tx.query_row("SELECT id FROM equipment_kinds WHERE name = ?1", [p], |r| r.get(0))?),
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO equipment_kinds(name, parent_id, requestable, sort_order) VALUES (?1, ?2, ?3, ?4)",
+            params![n, parent, requestable, i as i64],
+        )?;
+    }
+    // (model, kind, lendable)
     let types = [
-        ("Shure SM58 vocal mic", "Microphones", true),
-        ("Wireless handheld mic", "Microphones", true),
-        ("Wireless lapel mic", "Microphones", true),
+        ("Shure SM58 vocal mic", "Wired vocal mic", true),
+        ("Sennheiser e835 vocal mic", "Wired vocal mic", true),
+        ("Shure SLX2 wireless handheld", "Wireless vocal mic", true),
+        ("Sennheiser ME2 lapel mic", "Lapel mic", true),
         ("Mic stand", "Stands", true),
         ("XLR cable 10m", "Cables", true),
         ("DI box", "Cables", true),
@@ -37,8 +63,12 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
         ("Portable screen", "Video", true),
         ("Ceiling projector (installed)", "Video", false),
     ];
-    for (n, c, l) in types {
-        tx.execute("INSERT INTO equipment_types(name, category, lendable) VALUES (?1, ?2, ?3)", params![n, c, l])?;
+    for (n, k, l) in types {
+        tx.execute(
+            "INSERT INTO equipment_types(name, kind_id, lendable)
+             VALUES (?1, (SELECT id FROM equipment_kinds WHERE name = ?2), ?3)",
+            params![n, k, l],
+        )?;
     }
     let id = |table: &str, name: &str| -> rusqlite::Result<i64> {
         let col = if table == "events" { "title" } else { "name" };
@@ -48,8 +78,9 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
     // (room, type, qty)
     let stock = [
         ("Main Hall", "Shure SM58 vocal mic", 6),
-        ("Main Hall", "Wireless handheld mic", 4),
-        ("Main Hall", "Wireless lapel mic", 2),
+        ("Main Hall", "Sennheiser e835 vocal mic", 2),
+        ("Main Hall", "Shure SLX2 wireless handheld", 4),
+        ("Main Hall", "Sennheiser ME2 lapel mic", 2),
         ("Main Hall", "Mic stand", 6),
         ("Main Hall", "XLR cable 10m", 12),
         ("Main Hall", "DI box", 4),
@@ -61,11 +92,12 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
         ("Youth Room", "Speaker stand", 2),
         ("Youth Room", "12-channel mixer", 1),
         ("Youth Room", "Projector", 1),
-        ("Chapel", "Wireless handheld mic", 2),
+        ("Chapel", "Shure SLX2 wireless handheld", 2),
         ("Chapel", "Powered speaker", 2),
         ("Chapel", "Speaker stand", 2),
         ("Chapel", "12-channel mixer", 1),
         ("AV Store", "Shure SM58 vocal mic", 2),
+        ("AV Store", "Sennheiser e835 vocal mic", 2),
         ("AV Store", "Mic stand", 4),
         ("AV Store", "XLR cable 10m", 10),
         ("AV Store", "Powered speaker", 2),
@@ -108,9 +140,9 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             1,
             1,
             &[
-                ("Shure SM58 vocal mic", 5),
-                ("Wireless handheld mic", 3),
-                ("Wireless lapel mic", 1),
+                ("kind:Wired vocal mic", 5),
+                ("Shure SLX2 wireless handheld", 3),
+                ("Sennheiser ME2 lapel mic", 1),
                 ("Mic stand", 5),
                 ("XLR cable 10m", 10),
                 ("DI box", 4),
@@ -126,7 +158,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             "weekly",
             1,
             1,
-            &[("Wireless handheld mic", 2), ("Powered speaker", 2), ("Speaker stand", 2), ("12-channel mixer", 1)],
+            &[("Shure SLX2 wireless handheld", 2), ("Powered speaker", 2), ("Speaker stand", 2), ("12-channel mixer", 1)],
         ),
         (
             "Youth Sunday Night",
@@ -148,7 +180,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             ],
         ),
         ("Wednesday Prayer", "Chapel", "Prayer Ministry", "2026-01-07", "19:30", 90, "weekly", 1, 1, &[
-            ("Wireless handheld mic", 1),
+            ("Shure SLX2 wireless handheld", 1),
             ("Powered speaker", 1),
         ]),
         ("Friday Games Night", "Youth Room", "Youth Group", "2026-01-09", "19:00", 150, "weekly", 2, 1, &[
@@ -156,7 +188,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             ("Projector", 1),
         ]),
         ("Men's Breakfast", "Main Hall", "Men's Breakfast", "2026-01-03", "07:30", 120, "monthly", 1, 1, &[
-            ("Wireless handheld mic", 1),
+            ("Shure SLX2 wireless handheld", 1),
         ]),
     ];
     for (title, room, group, date, time, mins, rec, interval, nth, needs) in events {
@@ -167,10 +199,17 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
         )?;
         let eid = tx.last_insert_rowid();
         for (t, q) in needs {
-            tx.execute(
-                "INSERT INTO event_needs(event_id, type_id, quantity) VALUES (?1, ?2, ?3)",
-                params![eid, id("equipment_types", t)?, q],
-            )?;
+            // "kind:<name>" means any model of that kind.
+            match t.strip_prefix("kind:") {
+                Some(k) => tx.execute(
+                    "INSERT INTO event_needs(event_id, kind_id, quantity) VALUES (?1, ?2, ?3)",
+                    params![eid, id("equipment_kinds", k)?, q],
+                )?,
+                None => tx.execute(
+                    "INSERT INTO event_needs(event_id, type_id, quantity) VALUES (?1, ?2, ?3)",
+                    params![eid, id("equipment_types", t)?, q],
+                )?,
+            };
         }
     }
 
@@ -204,7 +243,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
     let choir_event = tx.last_insert_rowid();
     tx.execute(
         "INSERT INTO event_needs(event_id, type_id, quantity) VALUES (?1, ?2, 1)",
-        params![choir_event, id("equipment_types", "Wireless handheld mic")?],
+        params![choir_event, id("equipment_types", "Shure SLX2 wireless handheld")?],
     )?;
     tx.execute(
         "INSERT INTO bookings(id, token, status, room_id, title, organiser_name, organisation, email, phone, attendees,
@@ -224,7 +263,7 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
     )?;
     tx.execute(
         "INSERT INTO booking_needs(booking_id, type_id, quantity) VALUES (1, ?1, 1)",
-        [id("equipment_types", "Wireless handheld mic")?],
+        [id("equipment_types", "Shure SLX2 wireless handheld")?],
     )?;
     // Pending: a birthday party in the Main Hall that wants the PA.
     tx.execute(
@@ -234,12 +273,15 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
              'robin@example.org', 90, ?2, '17:00', 330, 'none', 1, 'Includes an hour to decorate and an hour to clean up.', ?3, ?3)",
         params![id("rooms", "Main Hall")?, saturday.to_string(), ts, crate::api::random_token(32)],
     )?;
-    for (t, q) in [("Wireless handheld mic", 2), ("Ceiling projector (installed)", 1)] {
-        tx.execute(
-            "INSERT INTO booking_needs(booking_id, type_id, quantity) VALUES (2, ?1, ?2)",
-            params![id("equipment_types", t)?, q],
-        )?;
-    }
+    // Any two vocal mics will do; the installed projector specifically.
+    tx.execute(
+        "INSERT INTO booking_needs(booking_id, kind_id, quantity) VALUES (2, ?1, 2)",
+        [id("equipment_kinds", "Vocal mic")?],
+    )?;
+    tx.execute(
+        "INSERT INTO booking_needs(booking_id, type_id, quantity) VALUES (2, ?1, 1)",
+        [id("equipment_types", "Ceiling projector (installed)")?],
+    )?;
 
     tx.commit()?;
     Ok(true)
