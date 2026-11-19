@@ -1,6 +1,6 @@
 //! SQLite schema and the queries that build an engine snapshot.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -206,6 +206,58 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", i64::from(i))?;
         tx.commit()?;
+    }
+    if version < 3 {
+        let tx = conn.transaction()?;
+        migrate_to_3(&tx)?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// 3: equipment becomes a tree. `equipment_types` gains `parent_id`; a row
+/// with children is an umbrella ("Wireless mic"), a leaf is a stocked model
+/// ("Sennheiser EW 100"). Existing free-text categories become top-level
+/// umbrellas so current data keeps working unchanged: every existing type
+/// stays a leaf with the same id, stock and history.
+fn migrate_to_3(tx: &Connection) -> rusqlite::Result<()> {
+    tx.execute("ALTER TABLE equipment_types ADD COLUMN parent_id INTEGER REFERENCES equipment_types(id)", [])?;
+    tx.execute("CREATE INDEX idx_equipment_parent ON equipment_types(parent_id)", [])?;
+    let mut stmt = tx.prepare("SELECT DISTINCT category FROM equipment_types WHERE category <> ''")?;
+    let cats: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    drop(stmt);
+    for cat in cats {
+        // Reuse an existing unstocked row with the category's name as the
+        // umbrella; otherwise create one (a stocked row must stay a leaf).
+        let existing: Option<Id> =
+            tx.query_row("SELECT id FROM equipment_types WHERE name = ?1", [&cat], |r| r.get(0)).optional()?;
+        let root = match existing {
+            Some(id) => {
+                let stocked: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM stock WHERE type_id = ?1 AND quantity > 0", [id], |r| r.get(0))?;
+                if stocked == 0 {
+                    id
+                } else {
+                    let name = format!("{cat} (group)");
+                    match tx.query_row("SELECT id FROM equipment_types WHERE name = ?1", [&name], |r| r.get(0)).optional()? {
+                        Some(id) => id,
+                        None => {
+                            tx.execute("INSERT INTO equipment_types(name, category) VALUES (?1, '')", [&name])?;
+                            tx.last_insert_rowid()
+                        }
+                    }
+                }
+            }
+            None => {
+                tx.execute("INSERT INTO equipment_types(name, category) VALUES (?1, '')", [&cat])?;
+                tx.last_insert_rowid()
+            }
+        };
+        tx.execute(
+            "UPDATE equipment_types SET parent_id = ?1 WHERE category = ?2 AND id <> ?1",
+            params![root, cat],
+        )?;
     }
     Ok(())
 }
@@ -438,6 +490,59 @@ pub fn loan_occupancy(pickup: NaiveDateTime, ret: NaiveDateTime, status: &str, b
     Span::new(pickup, effective_return + Duration::hours(buffer_hours.max(0)))
 }
 
+/// The equipment tree as stored: every node's parent, which leaves may be
+/// lent out, and display names. Used for request validation in the API.
+#[derive(Clone, Debug, Default)]
+pub struct EquipmentTree {
+    pub parents: HashMap<Id, Option<Id>>,
+    pub lendable: HashSet<Id>,
+    pub names: HashMap<Id, String>,
+}
+
+impl EquipmentTree {
+    pub fn root_id(&self, mut id: Id) -> Id {
+        let mut guard = 0;
+        while let Some(p) = self.parents.get(&id).copied().flatten() {
+            id = p;
+            guard += 1;
+            if guard > self.parents.len() {
+                break;
+            }
+        }
+        id
+    }
+
+    /// Top-level umbrella name for grouping in pickers ("" for roots).
+    pub fn category_of(&self, id: Id) -> String {
+        let root = self.root_id(id);
+        if root == id {
+            String::new()
+        } else {
+            self.names.get(&root).cloned().unwrap_or_default()
+        }
+    }
+
+    pub fn is_leaf(&self, id: Id) -> bool {
+        !self.parents.values().any(|p| *p == Some(id))
+    }
+}
+
+pub fn load_tree(conn: &Connection) -> rusqlite::Result<EquipmentTree> {
+    let mut tree = EquipmentTree::default();
+    let mut stmt = conn.prepare("SELECT id, name, parent_id, lendable FROM equipment_types")?;
+    for row in stmt.query_map([], |r| {
+        Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Id>>(2)?, r.get::<_, bool>(3)?))
+    })? {
+        let (id, name, parent, lendable) = row?;
+        tree.parents.insert(id, parent);
+        tree.names.insert(id, name);
+        if lendable {
+            tree.lendable.insert(id);
+        }
+    }
+    Ok(tree)
+}
+
 /// Build an engine snapshot covering `window`.
 pub fn load_world(
     conn: &Connection,
@@ -447,6 +552,9 @@ pub fn load_world(
     now: NaiveDateTime,
 ) -> rusqlite::Result<World> {
     let mut world = World::default();
+    let tree = load_tree(conn)?;
+    world.parents = tree.parents;
+    world.lendable = tree.lendable;
     let mut stmt = conn.prepare(
         "SELECT s.room_id, s.type_id, s.quantity FROM stock s
          JOIN equipment_types t ON t.id = s.type_id WHERE s.quantity > 0",
