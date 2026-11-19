@@ -64,11 +64,14 @@ HTTPS or on `localhost`.
 
 1. **Rooms**: e.g. Main Hall, Youth Room, Chapel, AV Store. Untick *can be booked online*
    for store rooms, and add a capacity and description for the rest.
-2. **Equipment**: types of gear (e.g. "Shure SM58"). Untick *lendable* for installed equipment.
-3. **Stock**: a grid of how many of each type live in each room.
+2. **Equipment**: the models you own (e.g. "Shure SM58"), grouped into **kinds** that can nest
+   (e.g. Microphones › Vocal mic › Wired vocal mic). People can ask for "any" of a kind and the
+   AV team picks the model; untick *requestable* for headings like Cables, where models aren't
+   interchangeable. Untick *lendable* for installed equipment.
+3. **Stock**: a grid of how many of each model live in each room, with subtotals per kind.
 4. **Groups**: regular users and their point of contact.
 5. **Church events**: e.g. "Sunday Morning Service, Main Hall, every Sunday 08:30–12:30,
-   needs 5 × SM58, 4 × DI box…". Events can be one-off, every N weeks, or the
+   needs 5 × any wired vocal mic, 4 × DI box…". Events can be one-off, every N weeks, or the
    nth/last weekday of the month.
 
 ### Room bookings
@@ -131,9 +134,13 @@ overlaps something still works (it may be intended), but staff are shown the cla
 * Only church events that **overlap that window** matter, so a Tuesday–Thursday loan
   ignores Sunday's needs.
 * Each room's events are covered **only from that room's own stock**.
-* For each room and item: `spare = stock − peak(event needs + other approved loans)` over
-  the window. Overlapping events in the same room add up.
-* Items are collected from the rooms with the most spare first (fewest pickups).
+* Requests and event needs name either a model or "any" of a kind. For each room and each
+  node of the equipment tree: `headroom = min over the window of (free stock below it − event
+  needs at or below it)`. Overlapping events in the same room add up. Because kinds nest,
+  checking every node this way is exact.
+* A request is spread over rooms with a small max-flow: exact models first, then the most
+  specific kinds, from the rooms with the most spare first (fewest pickups). "Any" only draws
+  on lendable models. See `docs/equipment-kinds.md`.
 * If short, the engine picks the room/groups that cover the shortfall while asking the fewest
   people, biggest users first, and states exactly what each would have to drop to.
   Anything that can't be covered even if every group agreed is reported separately
@@ -149,7 +156,7 @@ cargo test          # engine, recurrence and end-to-end API tests
 cargo run -- seed-demo && ADMIN_PASSWORD=devpassword cargo run
 ```
 
-* `src/engine.rs`: pure equipment availability/allocation/negotiation logic (unit-tested)
+* `src/engine.rs`: pure equipment availability/allocation/negotiation logic over the kind tree (unit-tested)
 * `src/clash.rs`: pure room clash detection (unit-tested)
 * `src/recurrence.rs`: expands recurring events into occurrences
 * `src/db.rs`: SQLite schema, migrations (`PRAGMA user_version`) and snapshot loading
@@ -157,4 +164,5 @@ cargo run -- seed-demo && ADMIN_PASSWORD=devpassword cargo run
 * `src/bookings.rs`: room booking API (staff + public)
 * `src/api.rs`: the rest of the JSON API (admin + public)
 * `docs/room-booking.md`: why bookings work the way they do
+* `docs/equipment-kinds.md`: equipment kinds (the tree) and how availability works over it
 * `static/`: the PWA (vanilla JS, no build step), embedded into the binary at compile time
