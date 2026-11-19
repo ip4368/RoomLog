@@ -64,12 +64,16 @@ HTTPS or on `localhost`.
 
 1. **Rooms**: e.g. Main Hall, Youth Room, Chapel, AV Store. Untick *can be booked online*
    for store rooms, and add a capacity and description for the rest.
-2. **Equipment**: types of gear (e.g. "Shure SM58"). Untick *lendable* for installed equipment.
-3. **Stock**: a grid of how many of each type live in each room.
+2. **Equipment**: a tree of gear. Groups (e.g. "Microphones" → "Wired vocal mic")
+   hold the stocked models at the ends (e.g. "Shure SM58"). People can ask for any
+   level — someone who just needs a mic picks the group and the AV team chooses the
+   model. Untick *lendable* on a model for installed equipment.
+3. **Stock**: a grid of how many of each model live in each room.
 4. **Groups**: regular users and their point of contact.
 5. **Church events**: e.g. "Sunday Morning Service, Main Hall, every Sunday 08:30–12:30,
-   needs 5 × SM58, 4 × DI box…". Events can be one-off, every N weeks, or the
-   nth/last weekday of the month.
+   needs 5 × SM58, 4 × DI box…". Needs can also be at group level ("any 5 wired
+   mics must stay"). Events can be one-off, every N weeks, or the nth/last weekday
+   of the month.
 
 ### Room bookings
 
@@ -111,6 +115,8 @@ which room to collect each item from. They never see group contact details.
   When they agree, click **Agreed** and the plan recalculates. The agreement is stored
   against that occurrence only, and is released automatically if the loan is
   declined, cancelled or returned.
+* **Models to hand out**: when the organiser asked for a group, the system suggests
+  concrete models; change them if you'd rather give out different ones.
 * **Approve & reserve** fixes the allocation (or **Approve partial loan** to lend what's
   available), then **Mark collected** → **Mark returned**.
 
@@ -132,8 +138,12 @@ overlaps something still works (it may be intended), but staff are shown the cla
   ignores Sunday's needs.
 * Each room's events are covered **only from that room's own stock**.
 * For each room and item: `spare = stock − peak(event needs + other approved loans)` over
-  the window. Overlapping events in the same room add up.
-* Items are collected from the rooms with the most spare first (fewest pickups).
+  the window, computed over the equipment tree: a need or request for a group counts
+  every model under it, and a group-level need ("any 5 wired mics stay") limits loans
+  of each model inside it. Overlapping events in the same room add up, across levels too.
+  One request can't name both a group and something inside it.
+* Items are collected from the rooms with the most spare first (fewest pickups);
+  group requests are allocated as concrete models, lendable ones only.
 * If short, the engine picks the room/groups that cover the shortfall while asking the fewest
   people, biggest users first, and states exactly what each would have to drop to.
   Anything that can't be covered even if every group agreed is reported separately
@@ -157,4 +167,5 @@ cargo run -- seed-demo && ADMIN_PASSWORD=devpassword cargo run
 * `src/bookings.rs`: room booking API (staff + public)
 * `src/api.rs`: the rest of the JSON API (admin + public)
 * `docs/room-booking.md`: why bookings work the way they do
+* `docs/equipment-tree.md`: why equipment is a tree and what each level means
 * `static/`: the PWA (vanilla JS, no build step), embedded into the binary at compile time

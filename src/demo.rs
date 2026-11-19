@@ -23,23 +23,50 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             params![name, bookable, capacity, public_notes],
         )?;
     }
-    let types = [
-        ("Shure SM58 vocal mic", "Microphones", true),
-        ("Wireless handheld mic", "Microphones", true),
-        ("Wireless lapel mic", "Microphones", true),
-        ("Mic stand", "Stands", true),
-        ("XLR cable 10m", "Cables", true),
-        ("DI box", "Cables", true),
-        ("Powered speaker", "Speakers", true),
-        ("Speaker stand", "Stands", true),
-        ("12-channel mixer", "Mixing", true),
-        ("Projector", "Video", true),
-        ("Portable screen", "Video", true),
-        ("Ceiling projector (installed)", "Video", false),
+    // The equipment tree: groups first, then the stocked models under them.
+    // Anything can be requested at any level — a borrower who just needs
+    // "a mic" picks Microphones and the AV team chooses the model.
+    let types: [(&str, Option<&str>, bool); 18] = [
+        ("Microphones", None, true),
+        ("Wired vocal mic", Some("Microphones"), true),
+        ("Shure SM58 vocal mic", Some("Wired vocal mic"), true),
+        ("Shure Beta 58A vocal mic", Some("Wired vocal mic"), true),
+        ("Wireless mic", Some("Microphones"), true),
+        ("Wireless handheld mic", Some("Wireless mic"), true),
+        ("Wireless lapel mic", Some("Wireless mic"), true),
+        ("Stands", None, true),
+        ("Mic stand", Some("Stands"), true),
+        ("Speaker stand", Some("Stands"), true),
+        ("Cables", None, true),
+        ("XLR cable 10m", Some("Cables"), true),
+        ("DI box", Some("Cables"), true),
+        ("Speakers", None, true),
+        ("Powered speaker", Some("Speakers"), true),
+        ("12-channel mixer", None, true),
+        ("Video", None, true),
+        ("Projector", Some("Video"), true),
     ];
-    for (n, c, l) in types {
-        tx.execute("INSERT INTO equipment_types(name, category, lendable) VALUES (?1, ?2, ?3)", params![n, c, l])?;
+    for (n, parent, l) in types {
+        let parent_id = match parent {
+            Some(p) => Some(tx.query_row("SELECT id FROM equipment_types WHERE name = ?1", [p], |r| r.get::<_, i64>(0))?),
+            None => None,
+        };
+        tx.execute(
+            "INSERT INTO equipment_types(name, lendable, parent_id) VALUES (?1, ?2, ?3)",
+            params![n, l, parent_id],
+        )?;
     }
+    // One-off rows that don't fit the table above.
+    tx.execute(
+        "INSERT INTO equipment_types(name, lendable, parent_id) VALUES ('Portable screen', 1,
+         (SELECT id FROM equipment_types WHERE name = 'Video'))",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO equipment_types(name, lendable, parent_id) VALUES ('Ceiling projector (installed)', 0,
+         (SELECT id FROM equipment_types WHERE name = 'Video'))",
+        [],
+    )?;
     let id = |table: &str, name: &str| -> rusqlite::Result<i64> {
         let col = if table == "events" { "title" } else { "name" };
         tx.query_row(&format!("SELECT id FROM {table} WHERE {col} = ?1"), [name], |r| r.get(0))
@@ -48,6 +75,8 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
     // (room, type, qty)
     let stock = [
         ("Main Hall", "Shure SM58 vocal mic", 6),
+        ("Main Hall", "Shure Beta 58A vocal mic", 2),
+        ("AV Store", "Shure Beta 58A vocal mic", 1),
         ("Main Hall", "Wireless handheld mic", 4),
         ("Main Hall", "Wireless lapel mic", 2),
         ("Main Hall", "Mic stand", 6),
@@ -155,8 +184,9 @@ pub fn seed(conn: &Connection) -> rusqlite::Result<bool> {
             ("Powered speaker", 2),
             ("Projector", 1),
         ]),
+        // Any wireless mic will do: the need is recorded at umbrella level.
         ("Men's Breakfast", "Main Hall", "Men's Breakfast", "2026-01-03", "07:30", 120, "monthly", 1, 1, &[
-            ("Wireless handheld mic", 1),
+            ("Wireless mic", 1),
         ]),
     ];
     for (title, room, group, date, time, mins, rec, interval, nth, needs) in events {
