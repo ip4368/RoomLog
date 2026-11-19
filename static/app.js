@@ -299,37 +299,93 @@ async function pageHome() {
   );
 }
 
+// ---------------------------------------------------------- equipment tree
+// Equipment is a tree of kinds ("Microphones" > "Vocal mic" > "Wired vocal mic")
+// with models (what's stocked, e.g. "Shure SM58") as leaves. A request line is
+// {kind_id, type_id}: "any model of this kind", or "exactly this model".
+
+const wantKey = (w) => (w.kind_id != null ? `k${w.kind_id}` : `m${w.type_id}`);
+const keyWant = (k) => (k[0] === 'k' ? { kind_id: +k.slice(1), type_id: null } : { kind_id: null, type_id: +k.slice(1) });
+
+/**
+ * Kinds and models in tree order, for pickers and tables: [{ key, depth, kind | model }].
+ * At each level sub-kinds come first, then models. Models whose kind isn't in
+ * `kinds` are listed at the top level.
+ */
+function treeRows(kinds, models) {
+  const known = new Set(kinds.map((k) => k.id));
+  const kidsOf = groupBy(kinds, (k) => (known.has(k.parent_id) ? k.parent_id : null));
+  const modelsOf = groupBy(models, (m) => (known.has(m.kind_id) ? m.kind_id : null));
+  const out = [];
+  const seen = new Set();
+  const walk = (parent, depth) => {
+    const ks = [...(kidsOf.get(parent) || [])].sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0) || a.name.localeCompare(b.name));
+    for (const k of ks) {
+      if (seen.has(k.id)) continue;
+      seen.add(k.id);
+      out.push({ key: `k${k.id}`, depth, kind: k });
+      walk(k.id, depth + 1);
+    }
+    for (const m of [...(modelsOf.get(parent) || [])].sort((a, b) => a.name.localeCompare(b.name))) {
+      out.push({ key: `m${m.id}`, depth, model: m });
+    }
+  };
+  walk(null, 0);
+  return out;
+}
+
+/** Kinds and models from a `refs` object, as arrays. */
+const refsCatalog = (refs) => ({
+  kinds: Object.entries(refs.kinds || {}).map(([id, k]) => ({ id: +id, ...k })),
+  models: Object.entries(refs.types).map(([id, t]) => ({ id: +id, ...t })),
+});
+
+const indent = (depth) => '\u00a0\u00a0\u00a0'.repeat(depth);
+
+/** A <select> of the tree. Requestable kinds read "Name (any)"; other kinds are headings. */
+function wantSelect(catalog, value) {
+  const s = h('select', { 'aria-label': 'Equipment' }, h('option', { value: '' }, 'Choose equipment…'));
+  for (const r of treeRows(catalog.kinds, catalog.models)) {
+    if (r.kind) {
+      s.append(h('option', { value: r.key, disabled: !r.kind.requestable, class: 'kind-option' },
+        indent(r.depth) + r.kind.name + (r.kind.requestable ? ' (any)' : '')));
+    } else {
+      s.append(h('option', { value: r.key }, indent(r.depth) + r.model.name));
+    }
+  }
+  if (value) {
+    if (![...s.options].some((o) => o.value === value && !o.disabled)) s.append(h('option', { value }, 'Other (no longer listed)'));
+    s.value = value;
+  }
+  return s;
+}
+
+/** Rows of "what × how many". catalog: { kinds, models }. */
 function itemsEditor(catalog, initial = []) {
   const wrap = h('div');
   const rows = h('div');
-  const byCat = groupBy(catalog, (c) => c.category || 'Other');
-  const makeSelect = (value) => {
-    const s = h('select', { 'aria-label': 'Equipment' }, h('option', { value: '' }, 'Choose equipment…'));
-    for (const [cat, items] of byCat) {
-      s.append(h('optgroup', { label: cat }, items.map((i) => h('option', { value: i.id }, i.name))));
-    }
-    if (value) s.value = value;
-    return s;
-  };
-  const addRow = (type_id, quantity = 1) => {
-    const sel = makeSelect(type_id);
+  const addRow = (key, quantity = 1) => {
+    const sel = wantSelect(catalog, key);
     const qty = h('input', { type: 'number', min: 1, value: quantity, 'aria-label': 'Quantity' });
     const row = h('div', { class: 'item-row' }, sel, qty,
       h('button', { type: 'button', class: 'small', title: 'Remove', onclick: () => row.remove() }, '✕'));
     rows.append(row);
   };
-  initial.forEach((i) => addRow(i.type_id, i.quantity));
+  initial.forEach((i) => addRow(wantKey(i), i.quantity));
   if (!initial.length) addRow();
   wrap.append(rows, h('button', { type: 'button', class: 'small', onclick: () => addRow() }, '+ Add item'));
   return {
     el: wrap,
     get() {
       return [...rows.children]
-        .map((r) => ({ type_id: +r.querySelector('select').value, quantity: +r.querySelector('input').value }))
-        .filter((i) => i.type_id && i.quantity > 0);
+        .map((r) => ({ key: r.querySelector('select').value, quantity: +r.querySelector('input').value }))
+        .filter((i) => i.key && i.quantity > 0)
+        .map((i) => ({ ...keyWant(i.key), quantity: i.quantity }));
     },
   };
 }
+
+const ANY_HINT = 'Choose a kind marked "(any)" if you don\'t mind which model; the AV team will pick one.';
 
 function publicCheckView(check) {
   if (check.fully_available) {
@@ -384,7 +440,7 @@ async function pageRequestForm() {
       field('Pick up from church', f.pickup_at, { required: true }),
       field('Return to church', f.return_at, { required: true })),
     h('h2', {}, 'Equipment'),
-    catalog.length ? items.el : h('p', { class: 'muted' }, 'No equipment is currently listed for loan.'),
+    catalog.models.length ? [h('p', { class: 'muted small' }, ANY_HINT), items.el] : h('p', { class: 'muted' }, 'No equipment is currently listed for loan.'),
     h('div', { class: 'field', style: 'margin-top:1rem' }, h('label', {}, 'Notes'), f.notes),
     result,
     h('div', { class: 'row' }, checkBtn, submitBtn));
@@ -440,7 +496,8 @@ async function pageStatus(token) {
         h('dt', {}, 'Pick up'), h('dd', {}, fmtDT(s.pickup_at)),
         h('dt', {}, 'Return'), h('dd', {}, fmtDT(s.return_at)))),
     h('div', { class: 'card' }, h('h2', {}, 'Requested'),
-      h('ul', {}, s.items.map((i) => h('li', {}, `${i.quantity} × ${i.name}`)))),
+      h('ul', {}, s.items.map((i) => h('li', {}, `${i.quantity} × ${i.name}`,
+        i.given && i.given.length ? h('span', { class: 'muted' }, ` → ${i.given.map((g) => `${g.quantity} × ${g.name}`).join(', ')}`) : null)))),
     s.collection.length ? h('div', { class: 'card' }, h('h2', {}, 'Where to collect'),
       s.collection.map((c) => [h('h3', {}, c.room), h('ul', {}, c.items.map((i) => h('li', {}, `${i.quantity} × ${i.name}`)))])) : null,
     cancelBtn,
@@ -549,19 +606,28 @@ function bookingForm(rooms, initial = {}, { staff = false } = {}) {
     : initial.recurrence === 'monthly' ? `monthly:${initial.nth}` : 'none';
   const roomInfo = h('div', { class: 'muted small' });
   const equipment = h('div');
-  const needQty = new Map((initial.needs || []).map((n) => [n.type_id, n.quantity]));
+  const needQty = new Map((initial.needs || []).map((n) => [wantKey(n), n.quantity]));
   const repeatFields = h('div');
 
   const refreshRoom = () => {
     const room = rooms.find((r) => String(r.id) === f.room.value);
     roomInfo.textContent = room ? room.public_notes : '';
-    equipment.replaceChildren(!room || !room.equipment.length
-      ? h('p', { class: 'muted small' }, 'No equipment is listed for this room.')
-      : h('div', {}, room.equipment.map((e) => {
-        const qty = h('input', { type: 'number', min: 0, max: e.quantity, value: needQty.get(e.type_id) || 0, 'aria-label': e.name, 'data-type': e.type_id });
-        qty.addEventListener('change', () => needQty.set(e.type_id, +qty.value || 0));
-        return h('div', { class: 'item-row' }, qty, h('span', {}, e.name, h('span', { class: 'muted small' }, ` (${e.quantity} in room)`)));
-      })));
+    if (!room || !room.equipment.length) {
+      equipment.replaceChildren(h('p', { class: 'muted small' }, 'No equipment is listed for this room.'));
+      return;
+    }
+    // The room's own tree: ask for "any" of a kind, or a specific model.
+    const models = room.equipment.map((e) => ({ id: e.type_id, name: e.name, kind_id: e.kind_id, quantity: e.quantity }));
+    equipment.replaceChildren(h('p', { class: 'muted small' }, ANY_HINT), h('div', {}, treeRows(room.kinds || [], models).map((r) => {
+      const item = r.kind || r.model;
+      const style = `padding-left:${r.depth * 1.2}rem`;
+      if (r.kind && !r.kind.requestable) return h('div', { class: 'tree-heading', style }, item.name);
+      const label = r.kind ? `${item.name} (any)` : item.name;
+      const qty = h('input', { type: 'number', min: 0, max: item.quantity, value: needQty.get(r.key) || 0, 'aria-label': label, 'data-want': r.key });
+      qty.addEventListener('change', () => needQty.set(r.key, +qty.value || 0));
+      return h('div', { class: 'item-row' + (r.kind ? ' kind' : ''), style }, qty,
+        h('span', {}, label, h('span', { class: 'muted small' }, ` (${item.quantity} in room)`)));
+    })));
   };
   const refreshRepeat = (keep) => {
     const current = keep ?? f.repeat.value;
@@ -589,7 +655,7 @@ function bookingForm(rooms, initial = {}, { staff = false } = {}) {
       recurrence: kind, interval_weeks: kind === 'weekly' ? +n : 1, nth: kind === 'monthly' ? +n : 1,
       until: kind === 'none' ? null : f.until.value || null,
       attendees: f.attendees.value ? +f.attendees.value : null,
-      needs: [...equipment.querySelectorAll('input[data-type]')].map((i) => ({ type_id: +i.dataset.type, quantity: +i.value || 0 })).filter((n) => n.quantity > 0),
+      needs: [...equipment.querySelectorAll('input[data-want]')].map((i) => ({ ...keyWant(i.dataset.want), quantity: +i.value || 0 })).filter((n) => n.quantity > 0),
       av_support: f.av_support.checked, public_title: f.public_title.checked, notes: f.notes.value,
       organiser_name: f.organiser_name.value, organisation: f.organisation.value, email: f.email.value, phone: f.phone.value,
     };
@@ -926,7 +992,7 @@ async function pageBooking(id) {
           b.email ? h('a', { href: `mailto:${b.email}` }, b.email) : null, b.email && b.phone ? ' · ' : '',
           b.phone ? h('a', { href: `tel:${b.phone}` }, b.phone) : null, !b.email && !b.phone ? '—' : null),
         b.attendees ? [h('dt', {}, 'People'), h('dd', {}, b.attendees)] : null,
-        h('dt', {}, 'Equipment'), h('dd', {}, b.needs.length ? b.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${typeName(refs, n.type_id)}`)) : 'None',
+        h('dt', {}, 'Equipment'), h('dd', {}, b.needs.length ? b.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${wantName(refs, n)}`)) : 'None',
           b.av_support ? h('span', { class: 'pill changed' }, 'AV help wanted') : null),
         h('dt', {}, 'Public calendar'), h('dd', {}, b.public_title ? `Shows "${b.title}"` : 'Shows "Booked"'),
         b.notes ? [h('dt', {}, 'Notes'), h('dd', {}, b.notes)] : null,
@@ -952,7 +1018,7 @@ async function pageBooking(id) {
     d.equipment_impact.length ? h('div', { class: 'banner warn' }, 'The equipment this booking needs would leave approved loans short:',
       h('ul', {}, d.equipment_impact.map((x) => h('li', {},
         h('a', { href: `/admin/loans/${x.loan_id}`, 'data-link': true }, x.loan_name || `Loan #${x.loan_id}`),
-        `: short by ${x.short_by} × ${typeName(refs, x.type_id)} in ${roomName(refs, x.room_id)}`))),
+        `: short by ${x.short_by} × ${nodeName(refs, x)} in ${roomName(refs, x.room_id)}`))),
       h('p', {}, 'Talk to the AV team before approving, or approve with less equipment.')) : null,
 
     canEdit ? h('div', { class: 'card' },
@@ -965,6 +1031,11 @@ async function pageBooking(id) {
 }
 
 const typeName = (refs, id) => (refs.types[id] ? refs.types[id].name : `#${id}`);
+const kindName = (refs, id) => (refs.kinds && refs.kinds[id] ? refs.kinds[id].name : `#${id}`);
+/** A request line: "Shure SM58", or "Wired vocal mic (any)". */
+const wantName = (refs, w) => (w.kind_id != null ? `${kindName(refs, w.kind_id)} (any)` : typeName(refs, w.type_id));
+/** A tree node, e.g. the kind or model a problem is about. */
+const nodeName = (refs, w) => (w.kind_id != null ? kindName(refs, w.kind_id) : typeName(refs, w.type_id));
 const roomName = (refs, id) => refs.rooms[id] || `#${id}`;
 
 /** Collect all "please manage with less" asks from an evaluation, grouped by group. */
@@ -979,7 +1050,7 @@ function collectAsks(ev) {
 function contactMessage(group, asks, refs, ctx) {
   const hi = group && group.contact_name ? `Hi ${group.contact_name.split(' ')[0]},` : 'Hi,';
   const who = ctx.loan ? `${ctx.loan.organisation || ctx.loan.organiser_name}${ctx.loan.event_name ? ` (${ctx.loan.event_name})` : ''}` : 'An external event';
-  const lines = asks.map((a) => `• ${fmtDT(a.start)} ${refs.events[a.event_id] || ''} in ${roomName(refs, a.room_id)}: ${a.reduce_to} × ${typeName(refs, a.type_id)} instead of the usual ${a.normally}`);
+  const lines = asks.map((a) => `• ${fmtDT(a.start)} ${refs.events[a.event_id] || ''} in ${roomName(refs, a.room_id)}: ${a.reduce_to} × ${nodeName(refs, a)} instead of the usual ${a.normally}`);
   const period = ctx.loan ? ` from ${fmtDT(ctx.loan.pickup_at)} to ${fmtDT(ctx.loan.return_at)}` : '';
   return `${hi}\n\n${who} has asked to borrow some of the church's AV equipment${period}. To make it work, could ${group ? group.name : 'your group'} manage with a bit less on:\n\n${lines.join('\n')}\n\nIf that's not possible, no problem, just let me know. Thanks!\n\n${churchName} AV team`;
 }
@@ -997,10 +1068,12 @@ function renderEvaluation(ev, refs, ctx = {}) {
     h('table', {},
       h('thead', {}, h('tr', {}, h('th', {}, 'Item'), h('th', { class: 'num' }, 'Requested'), h('th', { class: 'num' }, 'Can lend'), h('th', {}, 'Collect from'), h('th', {}, 'Room detail'))),
       h('tbody', {}, ev.items.map((i) => h('tr', {},
-        h('td', {}, typeName(refs, i.type_id)),
+        h('td', {}, wantName(refs, i)),
         h('td', { class: 'num' }, i.requested),
         h('td', { class: 'num' }, i.shortfall ? h('strong', { style: 'color:var(--bad)' }, i.available) : i.available),
-        h('td', {}, i.allocation.length ? i.allocation.map((a) => h('div', {}, `${a.qty} × ${roomName(refs, a.room_id)}`)) : h('span', { class: 'muted' }, 'none')),
+        h('td', {}, i.allocation.length ? i.allocation.map((a) => h('div', {},
+          i.kind_id != null ? `${a.qty} × ${typeName(refs, a.type_id)} (${roomName(refs, a.room_id)})` : `${a.qty} × ${roomName(refs, a.room_id)}`))
+          : h('span', { class: 'muted' }, 'none')),
         h('td', { class: 'small muted' }, i.rooms.map((r) => h('div', {},
           `${roomName(refs, r.room_id)}: owns ${r.stock}, church needs ${r.peak_event_need}`,
           r.peak_on_loan ? `, ${r.peak_on_loan} on other loans` : '',
@@ -1043,7 +1116,7 @@ function renderEvaluation(ev, refs, ctx = {}) {
           return h('div', { class: 'ask row' },
             h('div', {},
               h('div', {}, h('strong', {}, refs.events[a.event_id] || 'Event'), ` · ${roomName(refs, a.room_id)} · ${fmtDT(a.start)}–${fmtTime(a.end)}`),
-              h('div', {}, `${typeName(refs, a.type_id)}: `, h('span', { class: 'strike' }, a.normally), ` → ${a.reduce_to}`)),
+              h('div', {}, `${wantName(refs, a)}: `, h('span', { class: 'strike' }, a.normally), ` → ${a.reduce_to}`)),
             h('span', { class: 'spacer' }), btn);
         })));
     }
@@ -1053,7 +1126,7 @@ function renderEvaluation(ev, refs, ctx = {}) {
   if (unres.length) {
     out.push(h('div', { class: 'banner bad' }, 'Cannot be found even if every church group agreed:',
       h('ul', {}, unres.map((i) => h('li', {},
-        `${i.unresolvable} × ${typeName(refs, i.type_id)}`,
+        `${i.unresolvable} × ${wantName(refs, i)}`,
         i.blocking_loans.length ? h('span', {}, ' (some are out on loan ',
           i.blocking_loans.map((id, k) => [k ? ', ' : '', h('a', { href: `/admin/loans/${id}`, 'data-link': true }, `#${id}`)]), ')') : ' (not enough owned)')))));
   }
@@ -1064,6 +1137,7 @@ async function agree(a, ctx) {
   await POST('/api/overrides', {
     event_id: a.event_id,
     occurrence_start: a.start,
+    kind_id: a.kind_id,
     type_id: a.type_id,
     quantity: a.reduce_to,
     note: `Agreed for loan #${ctx.loan.id}`,
@@ -1157,7 +1231,12 @@ async function pageLoan(id) {
         h('dt', {}, 'Used at'), h('dd', {}, loan.event_location || '—'),
         h('dt', {}, 'Pick up'), h('dd', {}, fmtDT(loan.pickup_at)),
         h('dt', {}, 'Return'), h('dd', {}, fmtDT(loan.return_at), h('span', { class: 'muted small' }, ` (+${d.buffer_hours}h turnaround)`)),
-        h('dt', {}, 'Requested'), h('dd', {}, loan.items.map((i) => h('span', { class: 'pill' }, `${i.quantity} × ${typeName(refs, i.type_id)}`))),
+        h('dt', {}, 'Requested'), h('dd', {}, loan.items.map((i, k) => {
+          // For "any of a kind", show which models were given.
+          const given = i.kind_id != null && d.given[k] && d.given[k].length
+            ? ` → ${d.given[k].map((g) => `${g.qty} × ${typeName(refs, g.type_id)}`).join(', ')}` : '';
+          return h('span', { class: 'pill' }, `${i.quantity} × ${wantName(refs, i)}`, given ? h('span', { class: 'muted' }, given) : null);
+        })),
         loan.notes ? [h('dt', {}, 'Notes'), h('dd', {}, loan.notes)] : null,
         loan.decided_by ? [h('dt', {}, 'Decided by'), h('dd', {}, loan.decided_by)] : null),
       h('div', { class: 'row no-print', style: 'margin-top:0.8rem' },
@@ -1171,14 +1250,14 @@ async function pageLoan(id) {
       h('p', {}, 'Approving this one first reserves the equipment for it.')) : null,
 
     d.allocation_problems.length ? h('div', { class: 'banner bad' }, 'Schedule changed since approval: some rooms are now short.',
-      h('ul', {}, d.allocation_problems.map((p) => h('li', {}, `${roomName(refs, p.room_id)}: over by ${p.quantity} × ${typeName(refs, p.type_id)}`)))) : null,
+      h('ul', {}, d.allocation_problems.map((p) => h('li', {}, `${roomName(refs, p.room_id)}: over by ${p.over} × ${nodeName(refs, p)}`)))) : null,
 
     d.evaluation ? renderEvaluation(d.evaluation, refs, ctx) : null,
     loan.allocations.length && loan.status !== 'pending' ? pickList(loan, refs) : null,
 
     d.agreed_overrides.length ? h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Agreements recorded for this loan'),
       d.agreed_overrides.map((o) => h('div', { class: 'row ask' },
-        h('span', {}, `${refs.events[o.event_id] || 'Event'} · ${fmtDT(o.occurrence_start)} · ${o.type_id ? `${typeName(refs, o.type_id)} reduced to ${o.quantity}` : 'cancelled'}`),
+        h('span', {}, `${refs.events[o.event_id] || 'Event'} · ${fmtDT(o.occurrence_start)} · ${o.type_id != null || o.kind_id != null ? `${wantName(refs, o)} reduced to ${o.quantity}` : 'cancelled'}`),
         h('span', { class: 'spacer' }),
         h('button', { class: 'small', onclick: busy(null, async () => { await DEL(`/api/overrides/${o.id}`); reload(); }) }, 'Undo'))),
       h('p', { class: 'muted small' }, 'These are released automatically if the loan is declined, cancelled or returned.')) : null,
@@ -1192,7 +1271,7 @@ async function pageLoan(id) {
 }
 
 function editLoanDialog(loan, refs, reload) {
-  const catalog = Object.entries(refs.types).map(([id, t]) => ({ id: +id, name: t.name, category: t.category }));
+  const catalog = refsCatalog(refs);
   const pickup = h('input', { type: 'datetime-local', value: loan.pickup_at.slice(0, 16) });
   const ret = h('input', { type: 'datetime-local', value: loan.return_at.slice(0, 16) });
   const items = itemsEditor(catalog, loan.items);
@@ -1213,8 +1292,8 @@ function editLoanDialog(loan, refs, reload) {
 }
 
 async function pageCheck() {
-  const equipment = await GET('/api/equipment');
-  const catalog = equipment.filter((e) => e.total > 0);
+  const [kinds, equipment] = await Promise.all([GET('/api/kinds'), GET('/api/equipment')]);
+  const catalog = { kinds, models: equipment.filter((e) => e.total > 0) };
   const now = new Date();
   now.setMinutes(0, 0, 0);
   const pickup = h('input', { type: 'datetime-local', value: localInput(new Date(now.getTime() + 86400000)) });
@@ -1263,7 +1342,7 @@ async function pageSchedule() {
         h('div', { class: 'day' }, fmtDate(day + 'T00:00:00')),
         occs.map((o) => {
           const group = o.group_id ? refs.groups[o.group_id] : null;
-          const cancelOv = o.overrides.find((x) => x.type_id === null);
+          const cancelOv = o.overrides.find((x) => x.type_id === null && x.kind_id === null);
           const toggle = h('button', { class: 'small' }, o.cancelled ? 'Restore' : 'Cancel this date');
           toggle.addEventListener('click', busy(toggle, async () => {
             if (o.cancelled) await DEL(`/api/overrides/${cancelOv.id}`);
@@ -1281,13 +1360,14 @@ async function pageSchedule() {
                 d.booked_events[o.event_id] ? ' ' : null,
                 d.booked_events[o.event_id] ? h('a', { class: 'pill', href: `/admin/bookings/${d.booked_events[o.event_id]}`, 'data-link': true }, 'booking') : null,
                 o.cancelled ? h('span', { class: 'badge cancelled', style: 'margin-left:0.4rem' }, 'cancelled') : null),
-              h('div', {}, Object.entries(o.needs).map(([t, q]) => {
-                const usual = o.usual_needs[t];
-                const changed = usual !== q;
-                return h('span', { class: 'pill' + (changed ? ' changed' : '') }, `${q} × ${typeName(refs, t)}`, changed ? ` (usually ${usual ?? 0})` : '');
+              h('div', {}, o.needs.map((n) => {
+                const u = o.usual_needs.find((x) => wantKey(x) === wantKey(n));
+                const usual = u ? u.quantity : undefined;
+                const changed = usual !== n.quantity;
+                return h('span', { class: 'pill' + (changed ? ' changed' : '') }, `${n.quantity} × ${wantName(refs, n)}`, changed ? ` (usually ${usual ?? 0})` : '');
               })),
-              o.overrides.filter((x) => x.type_id !== null).map((x) => h('div', { class: 'small muted row' },
-                `${typeName(refs, x.type_id)} → ${x.quantity}${x.note ? ` · ${x.note}` : ''}`,
+              o.overrides.filter((x) => x.type_id !== null || x.kind_id !== null).map((x) => h('div', { class: 'small muted row' },
+                `${wantName(refs, x)} → ${x.quantity}${x.note ? ` · ${x.note}` : ''}`,
                 hasRole('av') ? h('button', { class: 'small', onclick: busy(null, async () => { await DEL(`/api/overrides/${x.id}`); reload(); }) }, 'Undo') : null))),
             toggle);
         })])),
@@ -1295,42 +1375,65 @@ async function pageSchedule() {
 }
 
 async function pageStock() {
-  const [rooms, equipment, stock] = await Promise.all([GET('/api/rooms'), GET('/api/equipment'), GET('/api/stock')]);
+  const [rooms, kinds, equipment, stock] = await Promise.all([GET('/api/rooms'), GET('/api/kinds'), GET('/api/equipment'), GET('/api/stock')]);
   if (!rooms.length || !equipment.length) {
     return render(h('h1', {}, 'Stock'), h('div', { class: 'banner info' }, 'Add some ',
       h('a', { href: '/admin/rooms', 'data-link': true }, 'rooms'), ' and ',
-      h('a', { href: '/admin/equipment', 'data-link': true }, 'equipment types'), ' first.'));
+      h('a', { href: '/admin/equipment', 'data-link': true }, 'equipment'), ' first.'));
   }
   const q = new Map(stock.map((s) => [`${s.room_id}:${s.type_id}`, s.quantity]));
-  const totals = new Map();
-  const byCat = groupBy(equipment, (e) => e.category || 'Other');
-  const body = [];
-  for (const [cat, types] of byCat) {
-    body.push(h('tr', { class: 'cat' }, h('td', { colspan: rooms.length + 2 }, cat)));
-    for (const t of types) {
-      const totalCell = h('td', { class: 'num' }, t.total);
-      totals.set(t.id, totalCell);
-      body.push(h('tr', {},
-        h('th', {}, t.name, t.lendable ? null : h('div', { class: 'muted small' }, 'not lendable')),
-        rooms.map((r) => {
-          const input = h('input', { type: 'number', min: 0, value: q.get(`${r.id}:${t.id}`) || 0, 'aria-label': `${t.name} in ${r.name}`, disabled: !hasRole('av') });
-          input.addEventListener('change', async () => {
-            try {
-              const quantity = Math.max(0, parseInt(input.value || '0', 10));
-              await PUT('/api/stock', { room_id: r.id, type_id: t.id, quantity });
-              q.set(`${r.id}:${t.id}`, quantity);
-              totalCell.textContent = rooms.reduce((s, rr) => s + (q.get(`${rr.id}:${t.id}`) || 0), 0);
-              toast('Saved');
-            } catch (e) { toast(e.message, true); }
-          });
-          return h('td', { class: 'num' }, input);
-        }),
-        totalCell));
+  // Kinds above each model, for the per-kind subtotal rows.
+  const parent = new Map(kinds.map((k) => [k.id, k.parent_id]));
+  const ancestors = (kindId) => {
+    const out = [];
+    for (let k = kindId; k != null && parent.has(k) && !out.includes(k); k = parent.get(k)) out.push(k);
+    return out;
+  };
+  const above = new Map(equipment.map((t) => [t.id, ancestors(t.kind_id)]));
+  const cells = []; // { room (null = total), kind | type, td }
+  const refresh = () => {
+    for (const c of cells) {
+      const models = c.type != null ? [c.type] : equipment.filter((t) => above.get(t.id).includes(c.kind)).map((t) => t.id);
+      const rs = c.room != null ? [c.room] : rooms.map((r) => r.id);
+      const sum = models.reduce((s, t) => s + rs.reduce((a, r) => a + (q.get(`${r}:${t}`) || 0), 0), 0);
+      c.td.textContent = sum;
     }
-  }
+  };
+  const body = treeRows(kinds, equipment).map((r) => {
+    const indented = `padding-left:${0.6 + r.depth * 1.2}rem`;
+    if (r.kind) {
+      const k = r.kind;
+      const tds = [...rooms.map((room) => ({ room: room.id })), { room: null }].map((c) => {
+        const td = h('td', { class: 'num' });
+        cells.push({ ...c, kind: k.id, td });
+        return td;
+      });
+      return h('tr', { class: 'cat' }, h('td', { style: indented }, k.name, k.requestable ? h('span', { class: 'muted small' }, ' (any)') : null), tds);
+    }
+    const t = r.model;
+    const totalCell = h('td', { class: 'num' });
+    cells.push({ room: null, type: t.id, td: totalCell });
+    return h('tr', {},
+      h('th', { style: indented }, t.name, t.lendable ? null : h('div', { class: 'muted small' }, 'not lendable')),
+      rooms.map((room) => {
+        const input = h('input', { type: 'number', min: 0, value: q.get(`${room.id}:${t.id}`) || 0, 'aria-label': `${t.name} in ${room.name}`, disabled: !hasRole('av') });
+        input.addEventListener('change', async () => {
+          try {
+            const quantity = Math.max(0, parseInt(input.value || '0', 10));
+            await PUT('/api/stock', { room_id: room.id, type_id: t.id, quantity });
+            q.set(`${room.id}:${t.id}`, quantity);
+            refresh();
+            toast('Saved');
+          } catch (e) { toast(e.message, true); }
+        });
+        return h('td', { class: 'num' }, input);
+      }),
+      totalCell);
+  });
+  refresh();
   render(
     h('h1', {}, 'Stock by room'),
-    h('p', { class: 'muted' }, 'Where each item normally lives. Changes save automatically.'),
+    h('p', { class: 'muted' }, 'Where each model normally lives. Kind rows show subtotals. Changes save automatically.'),
     hasRole('av') ? null : needsRoleNote('av'),
     h('div', { class: 'card table-wrap' }, h('table', { class: 'stock-matrix' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Equipment'), rooms.map((r) => h('th', { class: 'num' }, r.name)), h('th', { class: 'num' }, 'Total'))),
@@ -1338,10 +1441,13 @@ async function pageStock() {
   );
 }
 
-/** Generic list + inline editor page for simple entities. */
-function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, rowLabel, canEdit = true, editRole }) {
-  const editor = h('div');
-  const openEditor = (item) => {
+/**
+ * An inline add/edit form for one entity, shown in `editor`. Fields:
+ * { key, label, type: text|number|textarea|checkbox|select, options(item) → [[value, label, disabled?]] }.
+ * Select values are ids: '' becomes null, anything else a number.
+ */
+function crudEditor(editor, { fields, endpoint, rowLabel }) {
+  return (item) => {
     const isNew = !item.id;
     const inputs = {};
     const els = fields.map((f) => {
@@ -1351,8 +1457,13 @@ function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, row
         inputs[f.key] = input;
         return h('div', { class: 'field' }, h('label', { class: 'check' }, input, f.label));
       }
-      input = f.type === 'textarea' ? h('textarea') : h('input', { type: f.type || 'text', list: f.list || null });
-      input.value = item[f.key] ?? '';
+      if (f.type === 'select') {
+        input = h('select', {}, f.options(item).map(([v, l, disabled]) => h('option', { value: v, disabled }, l)));
+        input.value = item[f.key] ?? '';
+      } else {
+        input = f.type === 'textarea' ? h('textarea') : h('input', { type: f.type || 'text', list: f.list || null });
+        input.value = item[f.key] ?? '';
+      }
       inputs[f.key] = input;
       return field(f.label, input, { required: f.required, hint: f.hint });
     });
@@ -1371,7 +1482,7 @@ function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, row
       const body = { ...item };
       for (const f of fields) {
         const v = f.type === 'checkbox' ? inputs[f.key].checked : inputs[f.key].value;
-        body[f.key] = f.type === 'number' ? (v === '' ? null : Number(v)) : v;
+        body[f.key] = f.type === 'number' || f.type === 'select' ? (v === '' ? null : Number(v)) : v;
       }
       if (isNew) await POST(endpoint, body); else await PUT(`${endpoint}/${item.id}`, body);
       toast('Saved');
@@ -1381,6 +1492,12 @@ function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, row
     form.scrollIntoView({ behavior: 'smooth' });
     form.querySelector('input,textarea').focus();
   };
+}
+
+/** Generic list + inline editor page for simple entities. */
+function simpleCrud({ title, intro, items, columns, fields, endpoint, blank, rowLabel, canEdit = true, editRole }) {
+  const editor = h('div');
+  const openEditor = crudEditor(editor, { fields, endpoint, rowLabel });
   render(
     h('div', { class: 'row' }, h('h1', {}, title), h('span', { class: 'spacer' }),
       canEdit ? h('button', { class: 'primary', onclick: () => openEditor({ ...blank }) }, `+ Add ${rowLabel}`) : null),
@@ -1415,24 +1532,77 @@ async function pageRooms() {
 }
 
 async function pageEquipment() {
-  const items = await GET('/api/equipment');
-  const cats = [...new Set(items.map((i) => i.category).filter(Boolean))];
-  simpleCrud({
-    title: 'Equipment types', rowLabel: 'equipment type', endpoint: '/api/equipment', items,
-    canEdit: hasRole('av'), editRole: 'av',
-    intro: 'Kinds of equipment. Set how many are in each room on the Stock page.',
-    blank: { name: '', category: '', notes: '', lendable: true },
-    columns: [
-      { label: 'Name', key: 'name' }, { label: 'Category', key: 'category' },
-      { label: 'Lendable', render: (i) => (i.lendable ? 'Yes' : 'No') },
-      { label: 'Total owned', key: 'total', num: true }],
+  const [kinds, models] = await Promise.all([GET('/api/kinds'), GET('/api/equipment')]);
+  const canEdit = hasRole('av');
+  const editor = h('div');
+  const rows = treeRows(kinds, models);
+  const kindById = new Map(kinds.map((k) => [k.id, k]));
+  // A kind can't move under itself or its own sub-kinds.
+  const isUnder = (kindId, ancestorId) => {
+    for (let k = kindId, n = 0; k != null && n < 50; k = kindById.get(k)?.parent_id, n++) if (k === ancestorId) return true;
+    return false;
+  };
+  const kindOptions = (none, exclude) => [['', none],
+    ...rows.filter((r) => r.kind).map((r) => [r.kind.id, indent(r.depth) + r.kind.name, exclude != null && isUnder(r.kind.id, exclude)])];
+  const editKind = crudEditor(editor, {
+    endpoint: '/api/kinds', rowLabel: 'kind',
+    fields: [
+      { key: 'name', label: 'Name', required: true, hint: 'e.g. "Wireless vocal mic". Names are unique across the whole tree.' },
+      { key: 'parent_id', label: 'Inside', type: 'select', options: (k) => kindOptions('— top level —', k.id || null) },
+      { key: 'notes', label: 'Notes for people asking', type: 'textarea', hint: 'e.g. "Dynamic, with clip"' },
+      { key: 'requestable', label: 'People can ask for "any" of these (untick for headings like Cables, where models aren\'t interchangeable)', type: 'checkbox' }],
+  });
+  const editModel = crudEditor(editor, {
+    endpoint: '/api/equipment', rowLabel: 'model',
     fields: [
       { key: 'name', label: 'Name', required: true, hint: 'e.g. "Shure SM58 vocal mic"' },
-      { key: 'category', label: 'Category', list: 'cats', hint: 'e.g. Microphones, Cables, Speakers' },
+      { key: 'kind_id', label: 'Kind', type: 'select', options: () => kindOptions('— none —') },
       { key: 'notes', label: 'Notes', type: 'textarea' },
       { key: 'lendable', label: 'Can be lent out (untick for installed equipment)', type: 'checkbox' }],
   });
-  $app().append(h('datalist', { id: 'cats' }, cats.map((c) => h('option', { value: c }))));
+  const newKind = (parent_id = null) => editKind({ name: '', parent_id, requestable: true, sort_order: 0, notes: '' });
+  const newModel = (kind_id = null) => editModel({ name: '', kind_id, notes: '', lendable: true });
+
+  // Units owned below each kind.
+  const totals = new Map();
+  for (const m of models) {
+    for (let k = m.kind_id, n = 0; k != null && kindById.has(k) && n < 50; k = kindById.get(k).parent_id, n++) {
+      totals.set(k, (totals.get(k) || 0) + m.total);
+    }
+  }
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+  render(
+    h('div', { class: 'row' }, h('h1', {}, 'Equipment'), h('span', { class: 'spacer' }),
+      canEdit ? h('button', { onclick: () => newKind() }, '+ Add kind') : null,
+      canEdit ? h('button', { class: 'primary', onclick: () => newModel() }, '+ Add model') : null),
+    h('p', { class: 'muted' }, 'Models are what you own (set how many are in each room on the Stock page). ',
+      'Kinds group interchangeable models, so people can ask for "any wireless vocal mic" and the AV team picks which. ',
+      'Kinds can sit inside other kinds, e.g. Microphones › Vocal mic › Wireless vocal mic.'),
+    canEdit ? null : needsRoleNote('av'),
+    editor,
+    rows.length === 0 ? h('p', { class: 'muted' }, 'None yet.') :
+      h('div', { class: 'card table-wrap' }, h('table', { class: 'tree-table' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, ''), h('th', { class: 'num' }, 'Total owned'), canEdit ? h('th', {}, '') : null)),
+        h('tbody', {}, rows.map((r) => {
+          const indented = `padding-left:${0.6 + r.depth * 1.4}rem`;
+          if (r.kind) {
+            const k = r.kind;
+            return h('tr', { class: 'kind' + (canEdit ? ' clickable' : ''), onclick: canEdit ? () => editKind(k) : null },
+              h('td', { style: indented }, h('strong', {}, k.name), k.notes ? h('div', { class: 'muted small' }, k.notes) : null),
+              h('td', { class: 'small' }, k.requestable ? 'Kind · can ask for any' : h('span', { class: 'muted' }, 'Heading')),
+              h('td', { class: 'num' }, totals.get(k.id) || 0),
+              canEdit ? h('td', { class: 'nowrap' },
+                h('button', { class: 'small', onclick: stop(() => newKind(k.id)) }, '+ Kind'), ' ',
+                h('button', { class: 'small', onclick: stop(() => newModel(k.id)) }, '+ Model')) : null);
+          }
+          const m = r.model;
+          return h('tr', { class: canEdit ? 'clickable' : '', onclick: canEdit ? () => editModel(m) : null },
+            h('td', { style: indented }, m.name, m.notes ? h('div', { class: 'muted small' }, m.notes) : null),
+            h('td', { class: 'small muted' }, m.lendable ? 'Model' : 'Model · not lendable'),
+            h('td', { class: 'num' }, m.total),
+            canEdit ? h('td', {}) : null);
+        })))),
+  );
 }
 
 async function pageGroups() {
@@ -1453,10 +1623,11 @@ async function pageGroups() {
 }
 
 async function pageEvents() {
-  const [events, rooms, groups, equipment] = await Promise.all([GET('/api/events'), GET('/api/rooms'), GET('/api/groups'), GET('/api/equipment')]);
+  const [events, rooms, groups, kinds, equipment] = await Promise.all(
+    [GET('/api/events'), GET('/api/rooms'), GET('/api/groups'), GET('/api/kinds'), GET('/api/equipment')]);
   const rName = Object.fromEntries(rooms.map((r) => [r.id, r.name]));
   const gName = Object.fromEntries(groups.map((g) => [g.id, g.name]));
-  const tName = Object.fromEntries(equipment.map((t) => [t.id, t.name]));
+  const names = { types: Object.fromEntries(equipment.map((t) => [t.id, t])), kinds: Object.fromEntries(kinds.map((k) => [k.id, k])) };
   const editor = h('div');
 
   const openEditor = (ev) => {
@@ -1487,7 +1658,7 @@ async function pageEvents() {
     const until = h('input', { type: 'date', value: ev.until || '' });
     const notes = h('textarea');
     notes.value = ev.notes || '';
-    const needs = itemsEditor(equipment, ev.needs.length ? ev.needs : []);
+    const needs = itemsEditor({ kinds, models: equipment }, ev.needs.length ? ev.needs : []);
     const recFields = h('div', { class: 'grid' });
     const updateRec = () => {
       recFields.replaceChildren(...[
@@ -1515,7 +1686,7 @@ async function pageEvents() {
       h('div', { class: 'grid' }, field('Repeats', rec)),
       recFields,
       h('h3', {}, 'Minimum equipment that must stay in the room'),
-      h('p', { class: 'muted small' }, 'Only equipment from this room counts for this event.'),
+      h('p', { class: 'muted small' }, 'Only equipment from this room counts for this event. Choose a kind marked "(any)" when any model will do, so the AV team can lend whichever is spare.'),
       needs.el,
       h('div', { class: 'field', style: 'margin-top:1rem' }, h('label', {}, 'Notes'), notes),
       h('div', { class: 'row' }, save, h('button', { type: 'button', onclick: () => editor.replaceChildren() }, 'Cancel'),
@@ -1570,7 +1741,7 @@ async function pageEvents() {
           h('td', {}, h('strong', {}, e.title), e.booking_id ? [' ', h('span', { class: 'pill' }, 'booking')] : null,
             h('div', { class: 'muted small' }, e.group_id ? gName[e.group_id] : 'No regular group')),
           h('td', {}, e.description),
-          h('td', {}, e.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${tName[n.type_id]}`))))))))),
+          h('td', {}, e.needs.map((n) => h('span', { class: 'pill' }, `${n.quantity} × ${wantName(names, n)}`))))))))),
   );
 }
 
