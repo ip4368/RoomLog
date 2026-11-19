@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, ApiResult, AppState, clean, load_refs, now, random_token, required};
+use crate::api::{ApiError, ApiResult, AppState, clean, load_refs, now, random_token, required, validate_no_overlap};
 use crate::auth::{Role, Staff};
 use crate::clash::{self, Busy, Clash};
 use crate::db::{self, fmt_dt, parse_dt, recurrence_from_db, recurrence_to_db};
@@ -168,16 +168,26 @@ fn validate_slot(conn: &Connection, b: &BookingIn, public: bool) -> Result<Slot,
         }
         *merged.entry(n.type_id).or_insert(0) += n.quantity;
     }
+    let tree = db::load_tree(conn)?;
+    validate_no_overlap(&tree, &merged.iter().map(|(t, q)| (*t, *q)).collect::<Vec<_>>())?;
+    let mut room_stock: std::collections::HashMap<Id, i64> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT type_id, quantity FROM stock WHERE room_id = ?1")?;
+        for row in stmt.query_map([b.room_id], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))? {
+            let (t, q) = row?;
+            room_stock.insert(t, q);
+        }
+    }
     for (&type_id, &qty) in &merged {
-        let (name, in_room): (Option<String>, i64) = conn.query_row(
-            "SELECT t.name, COALESCE(s.quantity, 0) FROM equipment_types t
-             LEFT JOIN stock s ON s.type_id = t.id AND s.room_id = ?1 WHERE t.id = ?2",
-            params![b.room_id, type_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .unwrap_or((None, 0));
-        let name = name.ok_or_else(|| ApiError::bad("Unknown equipment type"))?;
+        let Some(name) = tree.names.get(&type_id) else {
+            return Err(ApiError::bad("Unknown equipment type"));
+        };
+        // Needs may name any level: the room must hold that many units
+        // somewhere under the requested node.
+        let in_room: i64 = engine::leaves_under(&tree.parents, type_id)
+            .iter()
+            .map(|l| room_stock.get(l).copied().unwrap_or(0))
+            .sum();
         if qty > in_room {
             return Err(ApiError::bad(format!("{room_name} only has {in_room} × {name}")));
         }
@@ -768,21 +778,73 @@ struct PublicEquipment {
     type_id: Id,
     name: String,
     category: String,
+    /// Units in this room at or under this node, so any level of the tree
+    /// can be picked for a booking.
     quantity: i64,
+    parent_id: Option<Id>,
+    is_leaf: bool,
+    depth: usize,
 }
 
 async fn public_rooms(State(st): State<AppState>) -> ApiResult<Value> {
     let conn = st.conn();
-    let mut stmt = conn.prepare(
-        "SELECT s.room_id, t.id, t.name, t.category, s.quantity FROM stock s
-         JOIN equipment_types t ON t.id = s.type_id WHERE s.quantity > 0 ORDER BY t.category, t.name",
-    )?;
+    let tree = db::load_tree(&conn)?;
+    let children = engine::children_map(&tree.parents);
+    let mut leaf_stock: HashMap<Id, HashMap<Id, i64>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT room_id, type_id, quantity FROM stock WHERE quantity > 0")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, Id>(1)?, r.get::<_, i64>(2)?)))? {
+            let (room, t, q) = row?;
+            leaf_stock.entry(room).or_default().insert(t, q);
+        }
+    }
+    // Tree order, parents before children, siblings alphabetical.
+    fn walk(
+        id: Id,
+        children: &HashMap<Id, Vec<Id>>,
+        names: &HashMap<Id, String>,
+        out: &mut Vec<Id>,
+    ) {
+        out.push(id);
+        let mut kids = children.get(&id).cloned().unwrap_or_default();
+        kids.sort_by(|a, b| names.get(a).cmp(&names.get(b)).then(a.cmp(b)));
+        for k in kids {
+            walk(k, children, names, out);
+        }
+    }
+    let mut roots: Vec<Id> = tree.parents.iter().filter(|(_, p)| p.is_none()).map(|(id, _)| *id).collect();
+    roots.sort_by(|a, b| tree.names.get(a).cmp(&tree.names.get(b)).then(a.cmp(b)));
+    let mut order = Vec::new();
+    for r in roots {
+        walk(r, &children, &tree.names, &mut order);
+    }
+    let mut by_depth = order.clone();
+    by_depth.sort_by_key(|a| std::cmp::Reverse(engine::depth_of(&tree.parents, *a)));
+
     let mut equipment: HashMap<Id, Vec<PublicEquipment>> = HashMap::new();
-    for row in stmt.query_map([], |r| {
-        Ok((r.get::<_, Id>(0)?, PublicEquipment { type_id: r.get(1)?, name: r.get(2)?, category: r.get(3)?, quantity: r.get(4)? }))
-    })? {
-        let (room, e) = row?;
-        equipment.entry(room).or_default().push(e);
+    for (room, leaves) in leaf_stock {
+        let mut sub: HashMap<Id, i64> = tree.parents.keys().map(|&id| (id, leaves.get(&id).copied().unwrap_or(0))).collect();
+        for &id in &by_depth {
+            if let Some(p) = tree.parents.get(&id).copied().flatten() {
+                let v = sub[&id];
+                *sub.entry(p).or_insert(0) += v;
+            }
+        }
+        let list: Vec<PublicEquipment> = order
+            .iter()
+            .copied()
+            .filter(|id| sub.get(id).copied().unwrap_or(0) > 0)
+            .map(|id| PublicEquipment {
+                type_id: id,
+                name: tree.names.get(&id).cloned().unwrap_or_default(),
+                category: tree.category_of(id),
+                quantity: sub[&id],
+                parent_id: tree.parents.get(&id).copied().flatten(),
+                is_leaf: tree.is_leaf(id),
+                depth: engine::depth_of(&tree.parents, id),
+            })
+            .collect();
+        equipment.insert(room, list);
     }
     let mut stmt =
         conn.prepare("SELECT id, name, capacity, public_notes FROM rooms WHERE bookable = 1 ORDER BY name")?;

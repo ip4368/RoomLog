@@ -251,37 +251,167 @@ struct EquipmentDto {
     #[serde(default)]
     id: Id,
     name: String,
+    /// Top-level umbrella name, for grouping (output only; structure comes
+    /// from `parent_id`).
     #[serde(default)]
     category: String,
+    /// Parent umbrella, or null at the top level. A node with children is
+    /// a group people can request as a whole; a leaf is a stocked model.
+    #[serde(default)]
+    parent_id: Option<Id>,
     #[serde(default)]
     notes: String,
+    /// For a model: may it be lent out? For a group: does it contain any
+    /// lendable model? (Output reflects the subtree; input sets the leaf.)
     #[serde(default = "yes")]
     lendable: bool,
+    /// Units owned in this node's subtree.
     #[serde(default)]
     total: i64,
+    /// Units owned in this subtree that may be lent out.
+    #[serde(default)]
+    lendable_total: i64,
+    #[serde(default)]
+    is_leaf: bool,
+    #[serde(default)]
+    depth: usize,
 }
 
 fn yes() -> bool {
     true
 }
 
+/// Reject a needs/items list naming both an umbrella and something under
+/// it: "2× Mic + 1× SM58" would be ambiguous (2 in total, or 3?).
+pub fn validate_no_overlap(tree: &db::EquipmentTree, items: &[(Id, i64)]) -> Result<(), ApiError> {
+    let mut nodes: Vec<Id> = items.iter().filter(|(_, q)| *q > 0).map(|(t, _)| *t).collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    for (i, &a) in nodes.iter().enumerate() {
+        for &b in &nodes[i + 1..] {
+            if engine::nodes_overlap(&tree.parents, a, b) {
+                let name = |id: Id| tree.names.get(&id).cloned().unwrap_or_else(|| "that equipment".into());
+                let (umbrella, below) =
+                    if engine::is_descendant_or_self(&tree.parents, a, b) { (b, a) } else { (a, b) };
+                return Err(ApiError::bad(format!(
+                    "Please choose either {} or {}, not both: {} already includes {}",
+                    name(umbrella),
+                    name(below),
+                    name(umbrella),
+                    name(below)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn list_equipment_rows(conn: &Connection) -> rusqlite::Result<Vec<EquipmentDto>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.category, t.notes, t.lendable, COALESCE(SUM(s.quantity), 0)
-         FROM equipment_types t LEFT JOIN stock s ON s.type_id = t.id
-         GROUP BY t.id ORDER BY t.category, t.name",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(EquipmentDto {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            category: r.get(2)?,
-            notes: r.get(3)?,
-            lendable: r.get(4)?,
-            total: r.get(5)?,
-        })
-    })?;
-    rows.collect()
+    let tree = db::load_tree(conn)?;
+    let children = engine::children_map(&tree.parents);
+    let mut notes: std::collections::HashMap<Id, String> = std::collections::HashMap::new();
+    let mut stmt = conn.prepare("SELECT id, notes FROM equipment_types")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, n) = row?;
+        notes.insert(id, n);
+    }
+    drop(stmt);
+    let mut leaf_stock: std::collections::HashMap<Id, i64> = std::collections::HashMap::new();
+    let mut stmt = conn.prepare("SELECT type_id, COALESCE(SUM(quantity), 0) FROM stock GROUP BY type_id")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?)))? {
+        let (id, q) = row?;
+        leaf_stock.insert(id, q);
+    }
+    drop(stmt);
+
+    // Subtree totals, deepest first so parents accumulate their children.
+    let mut by_depth: Vec<Id> = tree.parents.keys().copied().collect();
+    by_depth.sort_by(|a, b| {
+        engine::depth_of(&tree.parents, *b).cmp(&engine::depth_of(&tree.parents, *a)).then(a.cmp(b))
+    });
+    let mut total: std::collections::HashMap<Id, i64> = tree.parents.keys().map(|&id| (id, leaf_stock.get(&id).copied().unwrap_or(0))).collect();
+    let mut lendable_total: std::collections::HashMap<Id, i64> = tree
+        .parents
+        .keys()
+        .map(|&id| (id, if tree.lendable.contains(&id) { leaf_stock.get(&id).copied().unwrap_or(0) } else { 0 }))
+        .collect();
+    let mut any_lendable: std::collections::HashMap<Id, bool> =
+        tree.parents.keys().map(|&id| (id, tree.is_leaf(id) && tree.lendable.contains(&id))).collect();
+    for &id in &by_depth {
+        if let Some(p) = tree.parents.get(&id).copied().flatten() {
+            *total.entry(p).or_insert(0) += total[&id];
+            *lendable_total.entry(p).or_insert(0) += lendable_total[&id];
+            let v = any_lendable[&id];
+            *any_lendable.entry(p).or_insert(false) |= v;
+        }
+    }
+
+    // Tree order: parents before children, siblings alphabetical.
+    let mut out = Vec::new();
+    fn walk(
+        id: Id,
+        children: &std::collections::HashMap<Id, Vec<Id>>,
+        names: &std::collections::HashMap<Id, String>,
+        out: &mut Vec<Id>,
+    ) {
+        out.push(id);
+        let mut kids = children.get(&id).cloned().unwrap_or_default();
+        kids.sort_by(|a, b| names.get(a).cmp(&names.get(b)).then(a.cmp(b)));
+        for k in kids {
+            walk(k, children, names, out);
+        }
+    }
+    let mut roots: Vec<Id> = tree.parents.iter().filter(|(_, p)| p.is_none()).map(|(id, _)| *id).collect();
+    roots.sort_by(|a, b| tree.names.get(a).cmp(&tree.names.get(b)).then(a.cmp(b)));
+    let mut order = Vec::new();
+    for r in roots {
+        walk(r, &children, &tree.names, &mut order);
+    }
+    // Anything orphaned by a bad parent id still shows up, at the end.
+    let mut seen: std::collections::HashSet<Id> = order.iter().copied().collect();
+    for &id in tree.parents.keys() {
+        if seen.insert(id) {
+            order.push(id);
+        }
+    }
+    for id in order {
+        out.push(EquipmentDto {
+            id,
+            name: tree.names.get(&id).cloned().unwrap_or_default(),
+            category: tree.category_of(id),
+            parent_id: tree.parents.get(&id).copied().flatten(),
+            notes: notes.get(&id).cloned().unwrap_or_default(),
+            lendable: any_lendable.get(&id).copied().unwrap_or(false),
+            total: total.get(&id).copied().unwrap_or(0),
+            lendable_total: lendable_total.get(&id).copied().unwrap_or(0),
+            is_leaf: tree.is_leaf(id),
+            depth: engine::depth_of(&tree.parents, id),
+        });
+    }
+    Ok(out)
+}
+
+/// A parent must exist, must not create a loop, and must not itself hold
+/// stock: stocked rows are specific models (leaves). To group a stocked
+/// model, create the umbrella above it and move the model underneath.
+fn validate_parent(conn: &Connection, id: Id, parent_id: Option<Id>) -> Result<(), ApiError> {
+    let Some(parent) = parent_id else { return Ok(()) };
+    let tree = db::load_tree(conn)?;
+    let Some(parent_name) = tree.names.get(&parent).cloned() else {
+        return Err(ApiError::bad("Unknown parent group"));
+    };
+    if id != 0 && engine::is_descendant_or_self(&tree.parents, parent, id) {
+        return Err(ApiError::bad("An item cannot be moved under itself or under something inside it"));
+    }
+    let stocked: i64 =
+        conn.query_row("SELECT COALESCE(SUM(quantity), 0) FROM stock WHERE type_id = ?1", [parent], |r| r.get(0))?;
+    if stocked > 0 {
+        return Err(ApiError::bad(format!(
+            "{parent_name} has stock recorded, so it is a specific model and cannot have items under it. \
+             Create the group above it instead, then move {parent_name} into the group"
+        )));
+    }
+    Ok(())
 }
 
 async fn list_equipment(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<EquipmentDto>> {
@@ -291,12 +421,17 @@ async fn list_equipment(_: Staff, State(st): State<AppState>) -> ApiResult<Vec<E
 async fn create_equipment(staff: Staff, State(st): State<AppState>, Json(b): Json<EquipmentDto>) -> ApiResult<EquipmentDto> {
     staff.require(Role::Av)?;
     let conn = st.conn();
-    let (name, category, notes) = (required(&b.name, "Name")?, clean(&b.category, "Category")?, clean(&b.notes, "Notes")?);
+    let (name, notes) = (required(&b.name, "Name")?, clean(&b.notes, "Notes")?);
+    validate_parent(&conn, 0, b.parent_id)?;
+    // `category` is the pre-tree grouping, kept only so old rows round-trip;
+    // new rows group by tree position instead.
     conn.execute(
-        "INSERT INTO equipment_types(name, category, notes, lendable) VALUES (?1, ?2, ?3, ?4)",
-        params![name, category, notes, b.lendable],
+        "INSERT INTO equipment_types(name, category, notes, lendable, parent_id) VALUES (?1, '', ?2, ?3, ?4)",
+        params![name, notes, b.lendable, b.parent_id],
     )?;
-    Ok(Json(EquipmentDto { id: conn.last_insert_rowid(), name, category, notes, lendable: b.lendable, total: 0 }))
+    let id = conn.last_insert_rowid();
+    let row = list_equipment_rows(&conn)?.into_iter().find(|e| e.id == id).ok_or_else(ApiError::not_found)?;
+    Ok(Json(row))
 }
 
 async fn update_equipment(
@@ -307,10 +442,11 @@ async fn update_equipment(
 ) -> ApiResult<Value> {
     staff.require(Role::Av)?;
     let conn = st.conn();
-    let (name, category, notes) = (required(&b.name, "Name")?, clean(&b.category, "Category")?, clean(&b.notes, "Notes")?);
+    let (name, notes) = (required(&b.name, "Name")?, clean(&b.notes, "Notes")?);
+    validate_parent(&conn, id, b.parent_id)?;
     if conn.execute(
-        "UPDATE equipment_types SET name = ?1, category = ?2, notes = ?3, lendable = ?4 WHERE id = ?5",
-        params![name, category, notes, b.lendable, id],
+        "UPDATE equipment_types SET name = ?1, notes = ?2, lendable = ?3, parent_id = ?4 WHERE id = ?5",
+        params![name, notes, b.lendable, b.parent_id, id],
     )? == 0
     {
         return Err(ApiError::not_found());
@@ -321,9 +457,15 @@ async fn update_equipment(
 async fn delete_equipment(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>) -> ApiResult<Value> {
     staff.require(Role::Av)?;
     let conn = st.conn();
+    let children: i64 = conn.query_row("SELECT COUNT(*) FROM equipment_types WHERE parent_id = ?1", [id], |r| r.get(0))?;
+    if children > 0 {
+        return Err(ApiError::conflict("This group still contains equipment; move or delete those first", None));
+    }
     let active: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM loan_items i JOIN loans l ON l.id = i.loan_id
-         WHERE i.type_id = ?1 AND l.status IN ('pending','approved','collected')",
+        "SELECT (SELECT COUNT(*) FROM loan_items i JOIN loans l ON l.id = i.loan_id
+                  WHERE i.type_id = ?1 AND l.status IN ('pending','approved','collected'))
+              + (SELECT COUNT(*) FROM loan_allocations a JOIN loans l ON l.id = a.loan_id
+                  WHERE a.type_id = ?1 AND l.status IN ('approved','collected'))",
         [id],
         |r| r.get(0),
     )?;
@@ -356,6 +498,15 @@ async fn put_stock(staff: Staff, State(st): State<AppState>, Json(b): Json<Stock
         return Err(ApiError::bad("Quantity must be between 0 and 100000"));
     }
     let conn = st.conn();
+    let tree = db::load_tree(&conn)?;
+    let Some(name) = tree.names.get(&b.type_id).cloned() else {
+        return Err(ApiError::bad("Unknown equipment type"));
+    };
+    if !tree.is_leaf(b.type_id) {
+        return Err(ApiError::bad(format!(
+            "{name} is a group. Stock is recorded for the specific models under it"
+        )));
+    }
     if b.quantity == 0 {
         conn.execute("DELETE FROM stock WHERE room_id = ?1 AND type_id = ?2", params![b.room_id, b.type_id])?;
     } else {
@@ -544,6 +695,14 @@ fn validate_event(b: &EventDto) -> Result<(), ApiError> {
 
 fn save_event(conn: &mut Connection, id: Option<Id>, b: &EventDto) -> Result<Id, ApiError> {
     validate_event(b)?;
+    let tree = db::load_tree(conn)?;
+    let need_items: Vec<(Id, i64)> = b.needs.iter().filter(|n| n.quantity > 0).map(|n| (n.type_id, n.quantity)).collect();
+    for (t, _) in &need_items {
+        if !tree.parents.contains_key(t) {
+            return Err(ApiError::bad("Unknown equipment type"));
+        }
+    }
+    validate_no_overlap(&tree, &need_items)?;
     let tx = conn.transaction()?;
     let until = b.until.clone().filter(|u| !u.is_empty());
     let title = b.title.trim().to_string();
@@ -633,6 +792,7 @@ async fn delete_event(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) 
 pub struct TypeRef {
     pub name: String,
     category: String,
+    parent_id: Option<Id>,
 }
 
 /// id -> display name lookups sent alongside API responses.
@@ -651,11 +811,13 @@ pub fn load_refs(conn: &Connection) -> rusqlite::Result<Refs> {
         let (id, n) = r?;
         rooms.insert(id, n);
     }
+    let tree = db::load_tree(conn)?;
     let mut types = BTreeMap::new();
-    let mut stmt = conn.prepare("SELECT id, name, category FROM equipment_types")?;
-    for r in stmt.query_map([], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-        let (id, name, category) = r?;
-        types.insert(id, TypeRef { name, category });
+    for (&id, name) in &tree.names {
+        types.insert(
+            id,
+            TypeRef { name: name.clone(), category: tree.category_of(id), parent_id: tree.parents.get(&id).copied().flatten() },
+        );
     }
     let groups = list_group_rows(conn)?.into_iter().map(|g| (g.id, g)).collect();
     let mut events = BTreeMap::new();
@@ -944,22 +1106,28 @@ fn validate_request_core(conn: &Connection, pickup: &str, ret: &str, items: &[It
     if items.is_empty() || items.len() > MAX_ITEMS {
         return Err(ApiError::bad("Please request at least one item"));
     }
+    let tree = db::load_tree(conn)?;
     let mut merged: BTreeMap<Id, i64> = BTreeMap::new();
     for i in items {
         if !(1..=10_000).contains(&i.quantity) {
             return Err(ApiError::bad("Quantities must be at least 1"));
         }
-        let lendable: Option<bool> = conn
-            .query_row("SELECT lendable FROM equipment_types WHERE id = ?1", [i.type_id], |r| r.get(0))
-            .optional()?;
-        match lendable {
-            None => return Err(ApiError::bad("Unknown equipment type")),
-            Some(false) if public => return Err(ApiError::bad("That equipment is not available for loan")),
-            _ => {}
+        if !tree.parents.contains_key(&i.type_id) {
+            return Err(ApiError::bad("Unknown equipment type"));
+        }
+        if public {
+            // A group is lendable when any model under it is; the engine
+            // only ever allocates lendable models to umbrella requests.
+            let leaves = engine::leaves_under(&tree.parents, i.type_id);
+            if !leaves.iter().any(|l| tree.lendable.contains(l)) {
+                return Err(ApiError::bad("That equipment is not available for loan"));
+            }
         }
         *merged.entry(i.type_id).or_insert(0) += i.quantity;
     }
-    Ok(ValidLoan { pickup, ret, items: merged.into_iter().collect() })
+    let items: Vec<(Id, i64)> = merged.into_iter().collect();
+    validate_no_overlap(&tree, &items)?;
+    Ok(ValidLoan { pickup, ret, items })
 }
 
 fn evaluate_request(conn: &Connection, v: &ValidLoan, exclude: Option<Id>) -> Result<Evaluation, ApiError> {
@@ -1065,15 +1233,17 @@ async fn loan_detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
         vec![]
     };
 
-    // Other pending requests competing for the same equipment in the same period.
-    let type_ids: HashSet<Id> = items.iter().map(|i| i.0).collect();
+    // Other pending requests competing for the same equipment in the same
+    // period. With the tree, competition is subtree overlap: a request for
+    // "Mic" competes with one for "SM58".
+    let tree = db::load_tree(&conn)?;
     let mut competing = Vec::new();
     for other in loans_overlapping(&conn, &window)? {
         if other.id == id || other.status != "pending" {
             continue;
         }
         let ol = get_loan(&conn, other.id)?;
-        if ol.items.iter().any(|i| type_ids.contains(&i.type_id)) {
+        if ol.items.iter().any(|i| items.iter().any(|j| engine::nodes_overlap(&tree.parents, i.type_id, j.0))) {
             competing.push(other);
         }
     }
@@ -1171,8 +1341,22 @@ async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<I
 
     let allocations: Vec<(Id, Id, i64)> = match &b.allocations {
         Some(a) => {
+            // AV-chosen models: each must be a specific model (leaf) under
+            // something that was actually requested.
+            let tree = db::load_tree(&conn)?;
             let mut merged: BTreeMap<(Id, Id), i64> = BTreeMap::new();
             for x in a.iter().filter(|x| x.quantity > 0) {
+                let Some(name) = tree.names.get(&x.type_id) else {
+                    return Err(ApiError::bad("Unknown equipment type in allocation"));
+                };
+                if !tree.is_leaf(x.type_id) {
+                    return Err(ApiError::bad(format!(
+                        "{name} is a group. Allocate specific models so the organiser knows what to collect"
+                    )));
+                }
+                if !loan.items.iter().any(|i| engine::is_descendant_or_self(&tree.parents, x.type_id, i.type_id)) {
+                    return Err(ApiError::bad(format!("{name} was not part of this request")));
+                }
                 *merged.entry((x.room_id, x.type_id)).or_insert(0) += x.quantity;
             }
             merged.into_iter().map(|((r, t), q)| (r, t, q)).collect()
@@ -1186,7 +1370,7 @@ async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<I
                     Some(json!({ "shortfall": ev.items.iter().filter(|i| i.shortfall > 0).map(|i| json!({"type_id": i.type_id, "shortfall": i.shortfall})).collect::<Vec<_>>() })),
                 ));
             }
-            ev.items.iter().flat_map(|i| i.allocation.iter().map(move |a| (a.room_id, i.type_id, a.qty))).collect()
+            ev.items.iter().flat_map(|i| i.allocation.iter().map(|a| (a.room_id, a.type_id, a.qty))).collect()
         }
     };
     if allocations.is_empty() {
@@ -1301,10 +1485,17 @@ async fn public_info(State(st): State<AppState>) -> ApiResult<Value> {
 
 async fn public_catalog(State(st): State<AppState>) -> ApiResult<Value> {
     let conn = st.conn();
+    // Any level of the tree can be requested, as long as lendable models
+    // under it are actually owned. Installed-only branches stay hidden.
     let items: Vec<Value> = list_equipment_rows(&conn)?
         .into_iter()
-        .filter(|e| e.lendable && e.total > 0)
-        .map(|e| json!({ "id": e.id, "name": e.name, "category": e.category, "notes": e.notes }))
+        .filter(|e| e.lendable_total > 0)
+        .map(|e| {
+            json!({
+                "id": e.id, "name": e.name, "category": e.category, "notes": e.notes,
+                "parent_id": e.parent_id, "is_leaf": e.is_leaf, "depth": e.depth,
+            })
+        })
         .collect();
     Ok(Json(json!(items)))
 }

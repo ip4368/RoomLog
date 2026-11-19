@@ -660,3 +660,192 @@ async fn room_booking_workflow() {
     assert_eq!(detail["equipment_impact"][0]["loan_id"], loan);
     assert_eq!(detail["equipment_impact"][0]["short_by"], 2);
 }
+
+#[tokio::test]
+async fn equipment_tree_workflow() {
+    let mut c = Client::new();
+    c.login_admin().await;
+    let hall = c.ok("POST", "/api/rooms", Some(json!({"name": "Main Hall"}))).await["id"].as_i64().unwrap();
+    let youth = c.ok("POST", "/api/rooms", Some(json!({"name": "Youth Room"}))).await["id"].as_i64().unwrap();
+
+    // Microphones → Wired vocal mic → {SM58 model, Beta model};
+    //             → Wireless mic → {Handheld model}.
+    async fn equip(c: &mut Client, body: Value) -> i64 {
+        c.ok("POST", "/api/equipment", Some(body)).await["id"].as_i64().unwrap()
+    }
+    let mics = equip(&mut c, json!({"name": "Microphones"})).await;
+    let wired = equip(&mut c, json!({"name": "Wired vocal mic", "parent_id": mics})).await;
+    let sm58 = equip(&mut c, json!({"name": "SM58 model", "parent_id": wired})).await;
+    let beta = equip(&mut c, json!({"name": "Beta model", "parent_id": wired})).await;
+    let wireless = equip(&mut c, json!({"name": "Wireless mic", "parent_id": mics})).await;
+    let handheld = equip(&mut c, json!({"name": "Handheld model", "parent_id": wireless})).await;
+
+    // Stock belongs to models, not groups.
+    let (s, _) = c.call("PUT", "/api/stock", Some(json!({"room_id": hall, "type_id": wired, "quantity": 1}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // A stocked model can't gain children; groups go above it.
+    c.ok("PUT", "/api/stock", Some(json!({"room_id": hall, "type_id": sm58, "quantity": 2}))).await;
+    let (s, v) = c.call("POST", "/api/equipment", Some(json!({"name": "Sub-model", "parent_id": sm58}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    c.ok("PUT", "/api/stock", Some(json!({"room_id": hall, "type_id": beta, "quantity": 2}))).await;
+    c.ok("PUT", "/api/stock", Some(json!({"room_id": hall, "type_id": handheld, "quantity": 1}))).await;
+    c.ok("PUT", "/api/stock", Some(json!({"room_id": youth, "type_id": sm58, "quantity": 1}))).await;
+
+    // Subtree totals roll up; groups know they aren't leaves.
+    let equipment = c.ok("GET", "/api/equipment", None).await;
+    let find = |id: i64| equipment.as_array().unwrap().iter().find(|e| e["id"] == id).unwrap().clone();
+    assert_eq!(find(wired)["total"], 5);
+    assert_eq!(find(wired)["is_leaf"], false);
+    assert_eq!(find(mics)["total"], 6);
+    assert_eq!(find(sm58)["is_leaf"], true);
+
+    // The public catalog offers every level that has lendable stock.
+    let catalog = c.ok("GET", "/api/public/catalog", None).await;
+    let catalog_ids: Vec<i64> = catalog.as_array().unwrap().iter().map(|e| e["id"].as_i64().unwrap()).collect();
+    assert!(catalog_ids.contains(&mics) && catalog_ids.contains(&wired) && catalog_ids.contains(&sm58), "{catalog}");
+
+    // Sunday service keeps any 3 wired mics in the hall (umbrella need).
+    let sunday = next_sunday();
+    c.ok(
+        "POST",
+        "/api/events",
+        Some(json!({
+            "title": "Morning Service", "room_id": hall, "group_id": null,
+            "start_date": sunday.format("%Y-%m-%d").to_string(), "start_time": "09:00",
+            "duration_minutes": 180, "recurrence": "weekly", "interval_weeks": 1,
+            "needs": [{"type_id": wired, "quantity": 3}]
+        })),
+    )
+    .await;
+    // A group and a model inside it in one list is ambiguous: rejected.
+    let (s, _) = c
+        .call(
+            "POST",
+            "/api/events",
+            Some(json!({
+                "title": "Bad", "room_id": hall, "group_id": null,
+                "start_date": sunday.format("%Y-%m-%d").to_string(), "start_time": "20:00",
+                "duration_minutes": 60, "recurrence": "none",
+                "needs": [{"type_id": mics, "quantity": 1}, {"type_id": sm58, "quantity": 1}]
+            })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let sat = sunday - Duration::days(1);
+    let pickup = at(sat, "10:00");
+    let ret = at(sunday, "20:00");
+    // Over the weekend the hall spares 1 wired (4 owned − 3 needed), youth 1.
+    let check = c
+        .ok("POST", "/api/public/check", Some(json!({"pickup_at": pickup, "return_at": ret, "items": [{"type_id": wired, "quantity": 3}]})))
+        .await;
+    assert_eq!(check["items"][0]["available"], 2, "{check}");
+    assert_eq!(check["items"][0]["name"], "Wired vocal mic");
+    let (s, _) = c
+        .call(
+            "POST",
+            "/api/public/check",
+            Some(json!({"pickup_at": pickup, "return_at": ret, "items": [{"type_id": mics, "quantity": 1}, {"type_id": beta, "quantity": 1}]})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "group + model inside it is rejected");
+
+    // Borrower asks for the umbrella; the engine names concrete models,
+    // and AV can substitute a different model at approval.
+    let created = c
+        .ok(
+            "POST",
+            "/api/public/requests",
+            Some(json!({
+                "organiser_name": "Pat", "email": "pat@example.org", "event_name": "Camp",
+                "pickup_at": pickup, "return_at": ret, "items": [{"type_id": wired, "quantity": 2}]
+            })),
+        )
+        .await;
+    let token = created["token"].as_str().unwrap().to_string();
+    let loans = c.ok("GET", "/api/loans?status=pending", None).await;
+    let loan_id = loans[0]["id"].as_i64().unwrap();
+    let detail = c.ok("GET", &format!("/api/loans/{loan_id}"), None).await;
+    let allocs = detail["evaluation"]["items"][0]["allocation"].as_array().unwrap();
+    assert_eq!(allocs.iter().map(|a| a["qty"].as_i64().unwrap()).sum::<i64>(), 2);
+    assert!(allocs.iter().all(|a| [sm58, beta].contains(&a["type_id"].as_i64().unwrap())), "allocations are models: {detail}");
+
+    c.ok(
+        "POST",
+        &format!("/api/loans/{loan_id}/approve"),
+        Some(json!({"allocations": [
+            {"room_id": hall, "type_id": beta, "quantity": 1},
+            {"room_id": youth, "type_id": sm58, "quantity": 1}
+        ]})),
+    )
+    .await;
+    let status = c.ok("GET", &format!("/api/public/requests/{token}"), None).await;
+    assert_eq!(status["items"][0]["name"], "Wired vocal mic", "organiser asked for the umbrella");
+    let collected: Vec<&str> = status["collection"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r["items"].as_array().unwrap().iter().map(|i| i["name"].as_str().unwrap()))
+        .collect();
+    assert!(collected.contains(&"Beta model") && collected.contains(&"SM58 model"), "{status}");
+
+    // Room bookings: the room's equipment is offered at every level with
+    // pooled quantities, and an umbrella need becomes the event's need.
+    let rooms = c.ok("GET", "/api/public/rooms", None).await;
+    let hall_room = rooms.as_array().unwrap().iter().find(|r| r["id"] == hall).unwrap();
+    let wired_in_room = hall_room["equipment"].as_array().unwrap().iter().find(|e| e["type_id"] == wired).unwrap();
+    assert_eq!(wired_in_room["quantity"], 4);
+    let tuesday = sunday + Duration::days(2);
+    let booking = |qty: i64| {
+        json!({"room_id": hall, "title": "Choir", "organiser_name": "Casey", "email": "c@example.org",
+               "start_at": at(tuesday, "19:00"), "end_at": at(tuesday, "21:00"),
+               "needs": [{"type_id": wired, "quantity": qty}]})
+    };
+    let (s, _) = c.call("POST", "/api/public/bookings", Some(booking(5))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "more wired mics than the room holds");
+    c.ok("POST", "/api/public/bookings", Some(booking(3))).await;
+    let pending = c.ok("GET", "/api/bookings?status=pending", None).await;
+    let booking_id = pending[0]["id"].as_i64().unwrap();
+    c.ok("POST", &format!("/api/bookings/{booking_id}/approve"), Some(json!({}))).await;
+    let events = c.ok("GET", "/api/events", None).await;
+    let choir = events.as_array().unwrap().iter().find(|e| e["title"] == "Choir").unwrap();
+    assert_eq!(choir["needs"][0]["type_id"], wired);
+    assert_eq!(choir["needs"][0]["quantity"], 3);
+}
+
+#[test]
+fn migration_3_builds_tree_from_categories() {
+    let path = std::env::temp_dir().join(format!("roomlog-tree-migrate-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE equipment_types (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                 category TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+                 lendable INTEGER NOT NULL DEFAULT 1);
+             INSERT INTO equipment_types(name, category) VALUES
+                 ('SM58', 'Microphones'), ('Wireless mic', 'Microphones'), ('Mixer', '');
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+    let conn = db::open(path.to_str().unwrap()).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 3);
+    let tree = db::load_tree(&conn).unwrap();
+    let by_name: std::collections::HashMap<&str, i64> =
+        tree.names.iter().map(|(id, n)| (n.as_str(), *id)).collect();
+    let mics = by_name["Microphones"];
+    assert_eq!(tree.parents[&by_name["SM58"]], Some(mics));
+    assert_eq!(tree.parents[&by_name["Wireless mic"]], Some(mics));
+    assert_eq!(tree.parents[&by_name["Mixer"]], None);
+    assert!(tree.is_leaf(by_name["SM58"]));
+    drop(conn);
+    // Re-opening keeps a single Microphones umbrella.
+    let conn = db::open(path.to_str().unwrap()).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM equipment_types WHERE name = 'Microphones'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
