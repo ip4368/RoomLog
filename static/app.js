@@ -299,15 +299,47 @@ async function pageHome() {
   );
 }
 
+/** Sort a catalog into tree order and work out depth/leaf flags, so any
+ * level can be picked: groups read "Microphones — any model". */
+function treeCatalog(catalog) {
+  const byId = new Map(catalog.map((c) => [c.id, c]));
+  const hasChildren = new Set(catalog.map((c) => c.parent_id).filter((p) => p !== null && p !== undefined));
+  const depth = (c) => {
+    let d = 0;
+    let cur = c;
+    const seen = new Set();
+    while (cur && cur.parent_id !== null && cur.parent_id !== undefined && byId.has(cur.parent_id) && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      d++;
+      cur = byId.get(cur.parent_id);
+    }
+    return d;
+  };
+  const path = (c) => {
+    const parts = [];
+    let cur = c;
+    const seen = new Set();
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      parts.unshift(cur.name);
+      cur = cur.parent_id !== null && cur.parent_id !== undefined ? byId.get(cur.parent_id) : null;
+    }
+    return parts.join('\u0000');
+  };
+  return [...catalog]
+    .sort((a, b) => path(a).localeCompare(path(b)) || a.id - b.id)
+    .map((c) => ({ ...c, _depth: c.depth ?? depth(c), _isLeaf: c.is_leaf ?? !hasChildren.has(c.id) }));
+}
+
+const treeLabel = (c) => `${'\u00a0\u00a0'.repeat(c._depth || 0)}${c.name}${c._isLeaf ? '' : ' — any model'}`;
+
 function itemsEditor(catalog, initial = []) {
   const wrap = h('div');
   const rows = h('div');
-  const byCat = groupBy(catalog, (c) => c.category || 'Other');
+  const sorted = treeCatalog(catalog);
   const makeSelect = (value) => {
-    const s = h('select', { 'aria-label': 'Equipment' }, h('option', { value: '' }, 'Choose equipment…'));
-    for (const [cat, items] of byCat) {
-      s.append(h('optgroup', { label: cat }, items.map((i) => h('option', { value: i.id }, i.name))));
-    }
+    const s = h('select', { 'aria-label': 'Equipment' }, h('option', { value: '' }, 'Choose equipment…'),
+      sorted.map((i) => h('option', { value: i.id }, treeLabel(i))));
     if (value) s.value = value;
     return s;
   };
@@ -384,6 +416,7 @@ async function pageRequestForm() {
       field('Pick up from church', f.pickup_at, { required: true }),
       field('Return to church', f.return_at, { required: true })),
     h('h2', {}, 'Equipment'),
+    h('p', { class: 'muted small' }, 'Pick a group (marked "any model") if you don\'t mind which model you get — the AV team will choose. Don\'t pick both a group and something inside it.'),
     catalog.length ? items.el : h('p', { class: 'muted' }, 'No equipment is currently listed for loan.'),
     h('div', { class: 'field', style: 'margin-top:1rem' }, h('label', {}, 'Notes'), f.notes),
     result,
@@ -552,16 +585,30 @@ function bookingForm(rooms, initial = {}, { staff = false } = {}) {
   const needQty = new Map((initial.needs || []).map((n) => [n.type_id, n.quantity]));
   const repeatFields = h('div');
 
+  let needsEditor = null;
   const refreshRoom = () => {
     const room = rooms.find((r) => String(r.id) === f.room.value);
     roomInfo.textContent = room ? room.public_notes : '';
-    equipment.replaceChildren(!room || !room.equipment.length
-      ? h('p', { class: 'muted small' }, 'No equipment is listed for this room.')
-      : h('div', {}, room.equipment.map((e) => {
-        const qty = h('input', { type: 'number', min: 0, max: e.quantity, value: needQty.get(e.type_id) || 0, 'aria-label': e.name, 'data-type': e.type_id });
-        qty.addEventListener('change', () => needQty.set(e.type_id, +qty.value || 0));
-        return h('div', { class: 'item-row' }, qty, h('span', {}, e.name, h('span', { class: 'muted small' }, ` (${e.quantity} in room)`)));
-      })));
+    if (needsEditor) for (const n of needsEditor.get()) needQty.set(n.type_id, n.quantity);
+    if (!room || !room.equipment.length) {
+      needsEditor = null;
+      equipment.replaceChildren(h('p', { class: 'muted small' }, 'No equipment is listed for this room.'));
+      return;
+    }
+    const catalog = room.equipment.map((e) => ({
+      id: e.type_id,
+      name: `${e.name} (${e.quantity} in room)`,
+      parent_id: e.parent_id,
+      is_leaf: e.is_leaf,
+      depth: e.depth,
+    }));
+    const initialNeeds = [...needQty.entries()]
+      .filter(([t, q]) => q > 0 && room.equipment.some((e) => e.type_id === t))
+      .map(([type_id, quantity]) => ({ type_id, quantity }));
+    needsEditor = itemsEditor(catalog, initialNeeds);
+    equipment.replaceChildren(
+      h('p', { class: 'muted small' }, 'Pick a group (marked "any model") if any model in the room will do. Don\'t pick both a group and something inside it.'),
+      needsEditor.el);
   };
   const refreshRepeat = (keep) => {
     const current = keep ?? f.repeat.value;
@@ -589,7 +636,7 @@ function bookingForm(rooms, initial = {}, { staff = false } = {}) {
       recurrence: kind, interval_weeks: kind === 'weekly' ? +n : 1, nth: kind === 'monthly' ? +n : 1,
       until: kind === 'none' ? null : f.until.value || null,
       attendees: f.attendees.value ? +f.attendees.value : null,
-      needs: [...equipment.querySelectorAll('input[data-type]')].map((i) => ({ type_id: +i.dataset.type, quantity: +i.value || 0 })).filter((n) => n.quantity > 0),
+      needs: needsEditor ? needsEditor.get() : [],
       av_support: f.av_support.checked, public_title: f.public_title.checked, notes: f.notes.value,
       organiser_name: f.organiser_name.value, organisation: f.organisation.value, email: f.email.value, phone: f.phone.value,
     };
@@ -1000,7 +1047,9 @@ function renderEvaluation(ev, refs, ctx = {}) {
         h('td', {}, typeName(refs, i.type_id)),
         h('td', { class: 'num' }, i.requested),
         h('td', { class: 'num' }, i.shortfall ? h('strong', { style: 'color:var(--bad)' }, i.available) : i.available),
-        h('td', {}, i.allocation.length ? i.allocation.map((a) => h('div', {}, `${a.qty} × ${roomName(refs, a.room_id)}`)) : h('span', { class: 'muted' }, 'none')),
+        h('td', {}, i.allocation.length ? i.allocation.map((a) => h('div', {},
+          a.type_id === i.type_id ? `${a.qty} × ${roomName(refs, a.room_id)}`
+            : `${a.qty} × ${typeName(refs, a.type_id)} · ${roomName(refs, a.room_id)}`)) : h('span', { class: 'muted' }, 'none')),
         h('td', { class: 'small muted' }, i.rooms.map((r) => h('div', {},
           `${roomName(refs, r.room_id)}: owns ${r.stock}, church needs ${r.peak_event_need}`,
           r.peak_on_loan ? `, ${r.peak_on_loan} on other loans` : '',
@@ -1081,11 +1130,62 @@ function pickList(loan, refs) {
       h('ul', {}, allocs.map((a) => h('li', {}, `${a.quantity} × ${typeName(refs, a.type_id)}`)))]));
 }
 
+/** AV decides the concrete models for a pending loan. Starts from the
+ * engine's suggestion; approving reserves exactly this list. */
+function allocationEditor(loan, ev, refs) {
+  const types = Object.entries(refs.types).map(([id, t]) => ({ id: +id, name: t.name, parent_id: t.parent_id }));
+  const byId = new Map(types.map((t) => [t.id, t]));
+  const hasChildren = new Set(types.map((t) => t.parent_id).filter((p) => p !== null && p !== undefined));
+  const under = (leaf, anc) => {
+    let cur = byId.get(leaf);
+    const seen = new Set();
+    while (cur && !seen.has(cur.id)) {
+      if (cur.id === anc) return true;
+      seen.add(cur.id);
+      cur = cur.parent_id !== null && cur.parent_id !== undefined ? byId.get(cur.parent_id) : null;
+    }
+    return false;
+  };
+  const models = treeCatalog(types.filter((t) => !hasChildren.has(t.id) && loan.items.some((i) => under(t.id, i.type_id))));
+  const roomOpts = Object.entries(refs.rooms).map(([id, name]) => ({ id: +id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  const rows = h('div');
+  const addRow = (roomId, typeId, quantity = 1) => {
+    const roomSel = h('select', { 'aria-label': 'Room' }, roomOpts.map((r) => h('option', { value: r.id }, r.name)));
+    if (roomId) roomSel.value = roomId;
+    const modelSel = h('select', { 'aria-label': 'Model' }, h('option', { value: '' }, 'Choose model…'),
+      models.map((m) => h('option', { value: m.id }, treeLabel(m))));
+    if (typeId) modelSel.value = typeId;
+    const qty = h('input', { type: 'number', min: 1, value: quantity, 'aria-label': 'Quantity' });
+    const row = h('div', { class: 'item-row' }, modelSel, roomSel, qty,
+      h('button', { type: 'button', class: 'small', title: 'Remove', onclick: () => row.remove() }, '✕'));
+    rows.append(row);
+  };
+  ev.items.flatMap((i) => i.allocation).forEach((a) => addRow(a.room_id, a.type_id, a.qty));
+  const el = h('div', { class: 'card no-print' },
+    h('h2', { style: 'margin-top:0' }, 'Models to hand out'),
+    h('p', { class: 'muted small' }, 'Suggested from what is spare. Change any model or room: approving reserves exactly this list, and it becomes the organiser\'s collection list.'),
+    rows,
+    h('button', { type: 'button', class: 'small', onclick: () => addRow() }, '+ Add model'));
+  return {
+    el,
+    get() {
+      return [...rows.children].map((r) => {
+        const [modelSel, roomSel, qty] = r.querySelectorAll('select, input');
+        return { room_id: +roomSel.value, type_id: +modelSel.value, quantity: +qty.value };
+      }).filter((a) => a.room_id && a.type_id && a.quantity > 0);
+    },
+  };
+}
+
 async function pageLoan(id) {
   const d = await GET(`/api/loans/${id}`);
   const { loan, refs } = d;
   const reload = () => pageLoan(id);
   const ctx = { loan, reload };
+  const allocEditor = loan.status === 'pending' && hasRole('av') && d.evaluation
+    && d.evaluation.items.some((i) => i.available > 0)
+    ? allocationEditor(loan, d.evaluation, refs) : null;
+  const allocPayload = () => (allocEditor ? { allocations: allocEditor.get() } : {});
 
   const message = h('textarea', { placeholder: 'Shown to the organiser on their status page' });
   message.value = loan.message_to_organiser;
@@ -1114,14 +1214,14 @@ async function pageLoan(id) {
     const ev = d.evaluation;
     if (ev.fully_available) {
       act('Approve & reserve', 'primary', async () => {
-        await POST(`/api/loans/${id}/approve`, { message: message.value });
+        await POST(`/api/loans/${id}/approve`, { ...allocPayload(), message: message.value });
         toast('Approved');
       });
     } else {
       const canLend = ev.items.some((i) => i.available > 0);
       if (canLend) act('Approve partial loan', 'primary', async () => {
         if (!confirm('Not everything is available. Approve and reserve only what is available now?')) return false;
-        await POST(`/api/loans/${id}/approve`, { force: true, message: message.value });
+        await POST(`/api/loans/${id}/approve`, { ...allocPayload(), force: true, message: message.value });
         toast('Approved (partial)');
       });
     }
@@ -1174,6 +1274,7 @@ async function pageLoan(id) {
       h('ul', {}, d.allocation_problems.map((p) => h('li', {}, `${roomName(refs, p.room_id)}: over by ${p.quantity} × ${typeName(refs, p.type_id)}`)))) : null,
 
     d.evaluation ? renderEvaluation(d.evaluation, refs, ctx) : null,
+    allocEditor ? allocEditor.el : null,
     loan.allocations.length && loan.status !== 'pending' ? pickList(loan, refs) : null,
 
     d.agreed_overrides.length ? h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Agreements recorded for this loan'),
@@ -1192,7 +1293,7 @@ async function pageLoan(id) {
 }
 
 function editLoanDialog(loan, refs, reload) {
-  const catalog = Object.entries(refs.types).map(([id, t]) => ({ id: +id, name: t.name, category: t.category }));
+  const catalog = Object.entries(refs.types).map(([id, t]) => ({ id: +id, name: t.name, category: t.category, parent_id: t.parent_id }));
   const pickup = h('input', { type: 'datetime-local', value: loan.pickup_at.slice(0, 16) });
   const ret = h('input', { type: 'datetime-local', value: loan.return_at.slice(0, 16) });
   const items = itemsEditor(catalog, loan.items);
@@ -1296,14 +1397,16 @@ async function pageSchedule() {
 
 async function pageStock() {
   const [rooms, equipment, stock] = await Promise.all([GET('/api/rooms'), GET('/api/equipment'), GET('/api/stock')]);
-  if (!rooms.length || !equipment.length) {
+  // Stock is counted per model. Groups show their totals on Equipment.
+  const models = equipment.filter((e) => e.is_leaf);
+  if (!rooms.length || !models.length) {
     return render(h('h1', {}, 'Stock'), h('div', { class: 'banner info' }, 'Add some ',
       h('a', { href: '/admin/rooms', 'data-link': true }, 'rooms'), ' and ',
-      h('a', { href: '/admin/equipment', 'data-link': true }, 'equipment types'), ' first.'));
+      h('a', { href: '/admin/equipment', 'data-link': true }, 'equipment'), ' first.'));
   }
   const q = new Map(stock.map((s) => [`${s.room_id}:${s.type_id}`, s.quantity]));
   const totals = new Map();
-  const byCat = groupBy(equipment, (e) => e.category || 'Other');
+  const byCat = groupBy(models, (e) => e.category || 'Other equipment');
   const body = [];
   for (const [cat, types] of byCat) {
     body.push(h('tr', { class: 'cat' }, h('td', { colspan: rooms.length + 2 }, cat)));
@@ -1416,23 +1519,86 @@ async function pageRooms() {
 
 async function pageEquipment() {
   const items = await GET('/api/equipment');
-  const cats = [...new Set(items.map((i) => i.category).filter(Boolean))];
-  simpleCrud({
-    title: 'Equipment types', rowLabel: 'equipment type', endpoint: '/api/equipment', items,
-    canEdit: hasRole('av'), editRole: 'av',
-    intro: 'Kinds of equipment. Set how many are in each room on the Stock page.',
-    blank: { name: '', category: '', notes: '', lendable: true },
-    columns: [
-      { label: 'Name', key: 'name' }, { label: 'Category', key: 'category' },
-      { label: 'Lendable', render: (i) => (i.lendable ? 'Yes' : 'No') },
-      { label: 'Total owned', key: 'total', num: true }],
-    fields: [
-      { key: 'name', label: 'Name', required: true, hint: 'e.g. "Shure SM58 vocal mic"' },
-      { key: 'category', label: 'Category', list: 'cats', hint: 'e.g. Microphones, Cables, Speakers' },
-      { key: 'notes', label: 'Notes', type: 'textarea' },
-      { key: 'lendable', label: 'Can be lent out (untick for installed equipment)', type: 'checkbox' }],
-  });
-  $app().append(h('datalist', { id: 'cats' }, cats.map((c) => h('option', { value: c }))));
+  const canEdit = hasRole('av');
+  const editor = h('div');
+  const sorted = treeCatalog(items);
+  const descendantsOf = (id) => {
+    const under = new Set();
+    if (!id) return under;
+    const byId = new Map(items.map((i) => [i.id, i]));
+    for (const i of items) {
+      let cur = i;
+      const seen = new Set();
+      while (cur && cur.parent_id !== null && cur.parent_id !== undefined && !seen.has(cur.id)) {
+        if (cur.parent_id === id) { under.add(i.id); break; }
+        seen.add(cur.id);
+        cur = byId.get(cur.parent_id);
+      }
+    }
+    return under;
+  };
+  const openEditor = (item) => {
+    const isNew = !item.id;
+    const nameIn = h('input', { value: item.name || '' });
+    const below = descendantsOf(item.id);
+    // A stocked model cannot become a group; the API says the same.
+    const parentOpts = sorted.filter((c) => c.id !== item.id && !below.has(c.id) && !(c._isLeaf && c.total > 0));
+    const parentSel = h('select', {}, h('option', { value: '' }, '— top level —'),
+      parentOpts.map((c) => h('option', { value: c.id }, treeLabel(c))));
+    parentSel.value = item.parent_id ?? '';
+    const notesIn = h('textarea');
+    notesIn.value = item.notes || '';
+    const isGroup = !isNew && !item.is_leaf;
+    const lendableIn = h('input', { type: 'checkbox', checked: item.lendable !== false });
+    const save = h('button', { class: 'primary', type: 'submit' }, isNew ? 'Add' : 'Save');
+    const form = h('form', { class: 'card' },
+      h('h2', { style: 'margin-top:0' }, isNew ? 'Add equipment' : 'Edit equipment'),
+      h('div', { class: 'grid' },
+        field('Name', nameIn, { required: true, hint: 'A group people can ask for ("Wireless mic") or a stocked model ("Shure SM58")' }),
+        field('Inside group', parentSel, { hint: 'Leave at top level, or put it under a broader group' }),
+        field('Notes', notesIn)),
+      isGroup
+        ? h('p', { class: 'muted small' }, 'This is a group. Whether it can be lent depends on the models inside it.')
+        : h('div', { class: 'field' }, h('label', { class: 'check' }, lendableIn, 'Can be lent out (untick for installed equipment)')),
+      h('div', { class: 'row' }, save, h('button', { type: 'button', onclick: () => editor.replaceChildren() }, 'Cancel'),
+        isNew ? null : h('span', { class: 'spacer' }),
+        isNew ? null : h('button', { type: 'button', class: 'danger', onclick: busy(null, async () => {
+          if (!confirm('Delete this equipment?')) return;
+          await DEL(`/api/equipment/${item.id}`);
+          toast('Deleted');
+          route();
+        }) }, 'Delete')));
+    form.addEventListener('submit', busy(save, async () => {
+      const body = {
+        name: nameIn.value,
+        parent_id: parentSel.value ? +parentSel.value : null,
+        notes: notesIn.value,
+        lendable: isGroup ? true : lendableIn.checked,
+      };
+      if (isNew) await POST('/api/equipment', body); else await PUT(`/api/equipment/${item.id}`, body);
+      toast('Saved');
+      route();
+    }));
+    editor.replaceChildren(form);
+    form.scrollIntoView({ behavior: 'smooth' });
+    nameIn.focus();
+  };
+  render(
+    h('div', { class: 'row' }, h('h1', {}, 'Equipment'), h('span', { class: 'spacer' }),
+      canEdit ? h('button', { class: 'primary', onclick: () => openEditor({ name: '', parent_id: null, notes: '', lendable: true }) }, '+ Add equipment') : null),
+    h('p', { class: 'muted' }, 'Equipment is a tree. Groups (e.g. Microphones → Wireless mic) are what people ask for when any model will do; the models at the ends are what you count on the Stock page and hand out on loans. Any level can be requested.'),
+    canEdit ? null : needsRoleNote('av'),
+    editor,
+    items.length === 0 ? h('p', { class: 'muted' }, 'None yet.') :
+      h('div', { class: 'card table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', { class: 'num' }, 'Owned'), h('th', {}, 'Lendable'), h('th', {}, 'Notes'))),
+        h('tbody', {}, sorted.map((i) => h('tr', { class: canEdit ? 'clickable' : '', onclick: canEdit ? () => openEditor(items.find((x) => x.id === i.id)) : null },
+          h('td', {}, h('span', { style: `padding-left:${(i._depth || 0) * 1.4}rem` }, i.name),
+            i._isLeaf ? null : [' ', h('span', { class: 'pill' }, 'group')]),
+          h('td', { class: 'num' }, i.total),
+          h('td', {}, i._isLeaf ? (i.lendable ? 'Yes' : 'No') : (i.lendable_total > 0 ? `${i.lendable_total} of ${i.total}` : 'No')),
+          h('td', {}, i.notes)))))),
+  );
 }
 
 async function pageGroups() {
@@ -1515,7 +1681,7 @@ async function pageEvents() {
       h('div', { class: 'grid' }, field('Repeats', rec)),
       recFields,
       h('h3', {}, 'Minimum equipment that must stay in the room'),
-      h('p', { class: 'muted small' }, 'Only equipment from this room counts for this event.'),
+      h('p', { class: 'muted small' }, 'Only equipment from this room counts for this event. Pick a group (marked "any model") if any model under it will do; don\'t pick both a group and something inside it.'),
       needs.el,
       h('div', { class: 'field', style: 'margin-top:1rem' }, h('label', {}, 'Notes'), notes),
       h('div', { class: 'row' }, save, h('button', { type: 'button', onclick: () => editor.replaceChildren() }, 'Cancel'),
