@@ -1,0 +1,36 @@
+# Tier 1 packaged self-host: one church, automatic HTTPS.
+#   SITE_ADDRESS=rooms.example.org ADMIN_PASSWORD='choose-a-good-password' docker compose up -d
+# For a local HTTP-only try-out set SITE_ADDRESS=":80" and COOKIE_SECURE="0".
+# Fleet operators: replace DATABASE_PATH (image default) with TENANTS_DIR=/data
+# and provision tenants with `roomlog tenant-create` — see docs/deployment.md.
+services:
+  roomlog:
+    build: .
+    restart: unless-stopped
+    environment:
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Set ADMIN_PASSWORD for the first admin account}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-1}"
+    volumes:
+      - roomlog-data:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - roomlog
+    environment:
+      SITE_ADDRESS: "${SITE_ADDRESS:?Set SITE_ADDRESS to your domain, e.g. rooms.example.org}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  roomlog-data:
+  caddy-data:
+  caddy-config:

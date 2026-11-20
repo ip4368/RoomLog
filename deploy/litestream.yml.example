@@ -1,0 +1,14 @@
+# Generate the real file instead of editing paths by hand:
+#   TENANTS_DIR=/srv/roomlog roomlog backup-config s3://mybucket/roomlog > litestream.yml
+#   DATABASE_PATH=/data/roomlog.db roomlog backup-config s3://mybucket/roomlog > litestream.yml
+# Then run: litestream replicate -config litestream.yml
+# The fleet form below watches the tenants directory, so churches provisioned
+# later replicate without regenerating this file.
+dbs:
+  - dir: "/srv/roomlog"
+    pattern: "roomlog.db"
+    recursive: true
+    watch: true
+    meta-dir: "/srv/litestream-meta"
+    replica:
+      url: "s3://mybucket/roomlog"
