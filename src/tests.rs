@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::auth::{self, Role};
-use crate::{api, app, db};
+use crate::{api, app, db, fleet};
 
 struct Client {
     app: Router,
@@ -963,6 +963,24 @@ fn test_temp_dir(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn slug_and_host_rules() {
+    for ok in ["st-marys", "a", "church42", "st-marys-2"] {
+        assert!(fleet::valid_slug(ok), "{ok}");
+    }
+    for bad in ["", "www", "St-Marys", "-st-marys", "st-marys-", "st_marys", "st.marys", "../etc", "a/b"] {
+        assert!(!fleet::valid_slug(bad), "{bad}");
+    }
+    assert_eq!(fleet::tenant_from_host("st-marys.example.com", None).as_deref(), Some("st-marys"));
+    assert_eq!(fleet::tenant_from_host("st-marys.localhost:8080", None).as_deref(), Some("st-marys"));
+    assert_eq!(fleet::tenant_from_host("ST-MARYS.Example.COM:443", None).as_deref(), Some("st-marys"));
+    assert_eq!(fleet::tenant_from_host("example.com", Some("example.com")), None);
+    assert_eq!(fleet::tenant_from_host("st-marys.example.com", Some("example.com")).as_deref(), Some("st-marys"));
+    assert_eq!(fleet::tenant_from_host("st-marys.other.com", Some("example.com")), None);
+    assert_eq!(fleet::tenant_from_host("localhost", None), None);
+    assert_eq!(fleet::tenant_from_host("127.0.0.1:8080", None), None);
+}
+
+#[test]
 fn backup_and_check_round_trip() {
     let dir = test_temp_dir("backup");
     let src = dir.join("roomlog.db");
@@ -986,3 +1004,81 @@ fn backup_and_check_round_trip() {
     assert!(db::check_database_file(&junk).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+struct FleetClient {
+    app: Router,
+    host: String,
+    cookie: Option<String>,
+}
+
+impl FleetClient {
+    async fn call(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path).header(header::HOST, &self.host);
+        if let Some(c) = &self.cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        let req = match body {
+            Some(b) => req.header(header::CONTENT_TYPE, "application/json").body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        if let Some(sc) = resp.headers().get(header::SET_COOKIE) {
+            self.cookie = Some(sc.to_str().unwrap().split(';').next().unwrap().to_string());
+        }
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn ok(&mut self, method: &str, path: &str, body: Option<Value>) -> Value {
+        let (s, v) = self.call(method, path, body).await;
+        assert!(s.is_success(), "{method} {path} -> {s}: {v}");
+        v
+    }
+}
+
+#[tokio::test]
+async fn fleet_tenants_are_isolated() {
+    let dir = test_temp_dir("fleet");
+    fleet::create_tenant(&dir, "st-marys", "correct horse").unwrap();
+    fleet::create_tenant(&dir, "st-pauls", "correct horse").unwrap();
+    assert_eq!(fleet::list_tenants(&dir), ["st-marys", "st-pauls"]);
+    assert!(fleet::create_tenant(&dir, "st-marys", "correct horse").is_err(), "duplicate tenant refused");
+    assert!(fleet::create_tenant(&dir, "../escape", "correct horse").is_err(), "escaping slug refused");
+
+    let router = fleet::fleet_app(fleet::FleetState::new(dir.clone(), Some("example.com".into()), false, 4));
+    let mut marys = FleetClient { app: router.clone(), host: "st-marys.example.com".into(), cookie: None };
+    let mut pauls = FleetClient { app: router.clone(), host: "st-pauls.example.com".into(), cookie: None };
+
+    // Fleet health needs no tenant; unknown churches 404 without a folder.
+    let (s, v) = FleetClient { app: router.clone(), host: "example.com".into(), cookie: None }.call("GET", "/healthz", None).await;
+    assert_eq!((s, v["mode"].as_str()), (StatusCode::OK, Some("fleet")));
+    let (s, _) = FleetClient { app: router.clone(), host: "unknown.example.com".into(), cookie: None }.call("GET", "/api/public/info", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(!dir.join("unknown").exists(), "unknown tenant must not be created on disk");
+
+    // Same room name in both churches: data never crosses over.
+    for c in [&mut marys, &mut pauls] {
+        c.ok("POST", "/api/login", Some(json!({"username": "admin", "password": "correct horse"}))).await;
+    }
+    marys.ok("POST", "/api/rooms", Some(json!({"name": "Main Hall"}))).await;
+    assert_eq!(marys.ok("GET", "/api/rooms", None).await.as_array().unwrap().len(), 1);
+    assert_eq!(pauls.ok("GET", "/api/rooms", None).await.as_array().unwrap().len(), 0);
+    // A session cookie from one church means nothing at the other.
+    let mut thief = FleetClient { app: router.clone(), host: "st-pauls.example.com".into(), cookie: marys.cookie.clone() };
+    let (s, _) = thief.call("GET", "/api/rooms", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Portability: snapshot St Mary's, import it as a new tenant, data travels.
+    let snapshot = dir.join("marys-snapshot.db");
+    db::backup_database_file(&fleet::tenant_db_path(&dir, "st-marys"), &snapshot).unwrap();
+    fleet::import_tenant(&dir, "st-marys-copy", &snapshot).unwrap();
+    let mut copy = FleetClient { app: router, host: "st-marys-copy.example.com".into(), cookie: None };
+    copy.ok("POST", "/api/login", Some(json!({"username": "admin", "password": "correct horse"}))).await;
+    let rooms = copy.ok("GET", "/api/rooms", None).await;
+    assert_eq!(rooms[0]["name"], "Main Hall");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

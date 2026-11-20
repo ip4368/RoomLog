@@ -5,6 +5,7 @@ mod clash;
 mod db;
 mod demo;
 mod engine;
+mod fleet;
 mod recurrence;
 #[cfg(test)]
 mod tests;
@@ -56,8 +57,12 @@ async fn static_handler(uri: Uri, headers: HeaderMap) -> Response {
     asset_response("index.html", inm).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
+async fn health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "ok": true }))
+}
+
 pub fn app(state: api::AppState) -> axum::Router {
-    api::router(state).fallback(static_handler)
+    api::router(state).route("/healthz", axum::routing::get(health)).fallback(static_handler)
 }
 
 const DEFAULT_DB: &str = "roomlog.db";
@@ -103,17 +108,122 @@ fn bootstrap_admin(conn: &rusqlite::Connection) {
     }
 }
 
+const USAGE: &str = "\
+Usage:
+  roomlog                                   serve (single church, or fleet when TENANTS_DIR is set)
+  roomlog seed-demo                         load sample data into an empty single database
+  roomlog reset-password <username>         reset a staff password (read from stdin)
+  roomlog backup <destination.db>           snapshot the single database (DATABASE_PATH)
+  roomlog check-database <file.db>          validate a database file for import/use
+  roomlog tenant-create <slug>              create a fleet tenant (TENANTS_DIR, ADMIN_PASSWORD)
+  roomlog tenant-list                       list fleet tenants (TENANTS_DIR)
+  roomlog tenant-backup <slug> <dest.db>    snapshot one fleet tenant (TENANTS_DIR)
+  roomlog tenant-import <slug> <file.db>    import a database file as a new tenant (TENANTS_DIR)";
+
+fn die(msg: String) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(1)
+}
+
+fn tenants_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("TENANTS_DIR").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
+
+fn require_tenants_dir() -> std::path::PathBuf {
+    tenants_dir().unwrap_or_else(|| die("Set TENANTS_DIR to the fleet root for tenant commands".into()))
+}
+
+/// Commands that work on files/fleets without opening the single database.
+/// Returns true when a command ran.
+fn run_file_command(args: &[String]) -> bool {
+    match args.get(1).map(String::as_str) {
+        Some("help" | "--help" | "-h") => println!("{USAGE}"),
+        Some("backup") => {
+            let Some(dest) = args.get(2) else { die("Usage: roomlog backup <destination.db>".into()) };
+            let source = std::env::var("DATABASE_PATH").unwrap_or_else(|_| default_db_path());
+            match db::backup_database_file(std::path::Path::new(&source), std::path::Path::new(dest)) {
+                Ok(()) => println!("Snapshot of {source} written to {dest}"),
+                Err(e) => die(e),
+            }
+        }
+        Some("check-database") => {
+            let Some(path) = args.get(2) else { die("Usage: roomlog check-database <file.db>".into()) };
+            match db::check_database_file(std::path::Path::new(path)) {
+                Ok(v) => println!("{path} is a valid RoomLog database (schema version {v})"),
+                Err(e) => die(e),
+            }
+        }
+        Some("tenant-create") => {
+            let Some(slug) = args.get(2) else { die("Usage: roomlog tenant-create <slug>".into()) };
+            let password = std::env::var("ADMIN_PASSWORD")
+                .unwrap_or_else(|_| die("Set ADMIN_PASSWORD for the tenant's first admin account".into()));
+            match fleet::create_tenant(&require_tenants_dir(), slug, &password) {
+                Ok(p) => println!("Tenant {slug} created at {}", p.display()),
+                Err(e) => die(e),
+            }
+        }
+        Some("tenant-list") => {
+            for slug in fleet::list_tenants(&require_tenants_dir()) {
+                println!("{slug}");
+            }
+        }
+        Some("tenant-backup") => {
+            let (Some(slug), Some(dest)) = (args.get(2), args.get(3)) else {
+                die("Usage: roomlog tenant-backup <slug> <destination.db>".into())
+            };
+            let source = fleet::tenant_db_path(&require_tenants_dir(), slug);
+            match db::backup_database_file(&source, std::path::Path::new(dest)) {
+                Ok(()) => println!("Snapshot of tenant {slug} written to {dest}"),
+                Err(e) => die(e),
+            }
+        }
+        Some("tenant-import") => {
+            let (Some(slug), Some(source)) = (args.get(2), args.get(3)) else {
+                die("Usage: roomlog tenant-import <slug> <file.db>".into())
+            };
+            match fleet::import_tenant(&require_tenants_dir(), slug, std::path::Path::new(source)) {
+                Ok(p) => println!("Tenant {slug} imported at {}", p.display()),
+                Err(e) => die(e),
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
+
+    let args: Vec<String> = std::env::args().collect();
+    if run_file_command(&args) {
+        return;
+    }
+
+    let cookie_secure = matches!(std::env::var("COOKIE_SECURE").as_deref(), Ok("1" | "true" | "yes"));
+    let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+
+    if args.get(1).is_none()
+        && let Some(dir) = tenants_dir() {
+            if std::env::var_os("DATABASE_PATH").is_some_and(|v| !v.is_empty()) {
+                die("Set only one of TENANTS_DIR (fleet) and DATABASE_PATH (single church)".into());
+            }
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| die(format!("Cannot create {}: {e}", dir.display())));
+            let base_domain = std::env::var("BASE_DOMAIN").ok().map(|d| d.trim().trim_start_matches('.').to_ascii_lowercase()).filter(|d| !d.is_empty());
+            let max_open = std::env::var("MAX_OPEN_TENANTS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+            let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| die(format!("Failed to bind {bind}: {e}")));
+            tracing::info!("RoomLog fleet listening on http://{bind} (tenants: {})", dir.display());
+            axum::serve(listener, fleet::fleet_app(fleet::FleetState::new(dir, base_domain, cookie_secure, max_open)))
+                .await
+                .expect("server error");
+            return;
+        }
 
     let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| default_db_path());
     let conn = db::open(&db_path).unwrap_or_else(|e| {
         eprintln!("Failed to open database {db_path}: {e}");
         std::process::exit(1);
     });
-
-    let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("seed-demo") {
         match demo::seed(&conn) {
             Ok(true) => println!("Demo data loaded into {db_path}"),
@@ -150,9 +260,12 @@ async fn main() {
         return;
     }
 
+    if let Some(other) = args.get(1) {
+        eprintln!("Unknown command {other:?}\n{USAGE}");
+        std::process::exit(2);
+    }
+
     bootstrap_admin(&conn);
-    let cookie_secure = matches!(std::env::var("COOKIE_SECURE").as_deref(), Ok("1" | "true" | "yes"));
-    let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
     let state = api::AppState::new(conn, cookie_secure);
     let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| {
