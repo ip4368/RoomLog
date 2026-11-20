@@ -119,8 +119,12 @@ which room to collect each item from. They never see group contact details.
   When they agree, click **Agreed** and the plan recalculates. The agreement is stored
   against that occurrence only, and is released automatically if the loan is
   declined, cancelled or returned.
-* **Approve & reserve** fixes the allocation (or **Approve partial loan** to lend what's
-  available), then **Mark collected** → **Mark returned**.
+* **Models to hand out**: the suggested models and rooms for each item. For "any of a kind"
+  requests you can swap models, rooms and quantities; the server checks that every unit is
+  owned by that room and matches something requested.
+* **Approve & reserve** fixes the allocation (or **Approve partial loan** to lend fewer than
+  requested), then **Mark collected** → **Mark returned**. If a room can't spare what you chose,
+  you're warned and must confirm before church events in that room are left short.
 
 Other tools: **Quick check** (ad-hoc "can we lend X on these dates?"), **Schedule**
 (upcoming church events, cancel a single date such as school holidays, see what's out on loan).

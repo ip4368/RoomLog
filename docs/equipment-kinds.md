@@ -232,8 +232,12 @@ equipment needs are copied to its church event, both kind lines and model lines 
   per requestable kind and per model, and how many of each the room has.
 * **Availability / quick check**: one row per request line ("Any vocal mic: 4 of 4, from Main
   Hall"), with a per-model breakdown in the staff view.
-* **Approve**: the engine's allocation is what gets reserved, and it's re-validated against the caps.
-  The API accepts an explicit allocation too, but there's no UI yet for swapping models before approving.
+* **Approve**: the loan page has a **Models to hand out** editor seeded with the engine's
+  allocation; the AV team can swap models, rooms and quantities. The server accepts a chosen
+  allocation only if each unit is stocked in that room and matches a requested line (most
+  specific line first, via `match_allocation`), and no line gets more than requested. It is then
+  re-validated against the caps. Handing out fewer than requested needs `partial`; leaving a
+  room's church events short needs an explicit `force`, which the UI asks the user to confirm.
 * **Organiser status page**: once approved it lists the concrete models and rooms (it already
   lists allocations), e.g. "Any vocal mic → 3 × SM58, 1 × SLX2, collect from Main Hall".
 

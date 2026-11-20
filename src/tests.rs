@@ -865,3 +865,90 @@ async fn equipment_kinds_workflow() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "4 any + 2 e835 is more than the 5 vocal mics");
 }
+
+#[tokio::test]
+async fn staff_choose_which_models_go_out() {
+    let mut c = Client::new();
+    c.login_admin().await;
+    let id = |v: Value| v["id"].as_i64().unwrap();
+    let hall = id(c.ok("POST", "/api/rooms", Some(json!({"name": "Main Hall"}))).await);
+    let youth = id(c.ok("POST", "/api/rooms", Some(json!({"name": "Youth Room"}))).await);
+    let mics = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Microphones"}))).await);
+    let wired = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Wired vocal mic", "parent_id": mics}))).await);
+    let ceiling = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Ceiling mic", "parent_id": mics}))).await);
+    let cables = id(c.ok("POST", "/api/kinds", Some(json!({"name": "Cables", "requestable": false}))).await);
+    let sm58 = id(c.ok("POST", "/api/equipment", Some(json!({"name": "SM58", "kind_id": wired}))).await);
+    let e835 = id(c.ok("POST", "/api/equipment", Some(json!({"name": "e835", "kind_id": wired}))).await);
+    let fixed = id(c.ok("POST", "/api/equipment", Some(json!({"name": "Array mic", "kind_id": ceiling, "lendable": false}))).await);
+    let xlr = id(c.ok("POST", "/api/equipment", Some(json!({"name": "XLR", "kind_id": cables}))).await);
+    for (room, t, q) in [(hall, sm58, 3), (hall, e835, 2), (youth, sm58, 1), (hall, xlr, 4), (hall, fixed, 1)] {
+        c.ok("PUT", "/api/stock", Some(json!({"room_id": room, "type_id": t, "quantity": q}))).await;
+    }
+    let sunday = next_sunday();
+    let (pickup, ret) = (at(sunday + Duration::days(2), "10:00"), at(sunday + Duration::days(3), "10:00"));
+
+    // The public can't ask for a kind with nothing lendable under it; staff can.
+    let request = |items: Value| json!({"organiser_name": "Pat", "email": "p@example.org", "pickup_at": pickup, "return_at": ret, "items": items});
+    let (s, v) = c.call("POST", "/api/public/check", Some(request(json!([{"kind_id": ceiling, "quantity": 1}])))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Ceiling mic"), "{v}");
+
+    // The youth room's SM58 is needed by an event during the loan.
+    c.ok(
+        "POST",
+        "/api/events",
+        Some(json!({
+            "title": "Youth night", "room_id": youth, "group_id": null,
+            "start_date": (sunday + Duration::days(2)).to_string(), "start_time": "18:00", "duration_minutes": 120,
+            "recurrence": "none", "needs": [{"type_id": sm58, "quantity": 1}]
+        })),
+    )
+    .await;
+
+    let loan = id(c.ok("POST", "/api/loans", Some(request(json!([{"kind_id": wired, "quantity": 2}])))).await);
+    let approve = |body: Value| (format!("/api/loans/{loan}/approve"), body);
+    let alloc = |picks: &[(i64, i64, i64)]| -> Value {
+        picks.iter().map(|&(r, t, q)| json!({"room_id": r, "type_id": t, "quantity": q})).collect()
+    };
+
+    // Each chosen unit must be owned by the room and serve something requested.
+    for (picks, why) in [
+        (vec![(hall, xlr, 1), (hall, sm58, 1)], "doesn't match"),
+        (vec![(hall, sm58, 5)], "only has 3"),
+        (vec![(hall, sm58, 3)], "more than was asked for"),
+    ] {
+        let (path, body) = approve(json!({"allocations": alloc(&picks)}));
+        let (s, v) = c.call("POST", &path, Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap().contains(why), "{why}: {v}");
+    }
+
+    // Handing out less than requested needs `partial`.
+    let (path, body) = approve(json!({"allocations": alloc(&[(hall, e835, 1)])}));
+    let (s, v) = c.call("POST", &path, Some(body)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["detail"]["shortfall"][0]["shortfall"], 1, "{v}");
+
+    // A partial approval still can't overbook; only an explicit force can.
+    let (path, body) = approve(json!({"allocations": alloc(&[(youth, sm58, 1)]), "partial": true}));
+    let (s, v) = c.call("POST", &path, Some(body)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["detail"][0]["room_id"], youth, "{v}");
+
+    // The AV team prefers to send both e835s rather than the suggested SM58s.
+    let detail = c.ok("GET", &format!("/api/loans/{loan}"), None).await;
+    assert_eq!(detail["evaluation"]["fully_available"], true);
+    let (path, body) = approve(json!({"allocations": alloc(&[(hall, e835, 2)])}));
+    c.ok("POST", &path, Some(body)).await;
+    let detail = c.ok("GET", &format!("/api/loans/{loan}"), None).await;
+    assert_eq!(detail["loan"]["status"], "approved");
+    assert_eq!(detail["loan"]["allocations"], json!([{"room_id": hall, "type_id": e835, "quantity": 2}]));
+    assert_eq!(detail["given"][0][0]["type_id"], e835);
+
+    // Forcing an overbooking is possible, but only on purpose.
+    let loan2 = id(c.ok("POST", "/api/loans", Some(request(json!([{"type_id": sm58, "quantity": 1}])))).await);
+    let path = format!("/api/loans/{loan2}/approve");
+    let (s, _) = c.call("POST", &path, Some(json!({"allocations": alloc(&[(youth, sm58, 1)])}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    c.ok("POST", &path, Some(json!({"allocations": alloc(&[(youth, sm58, 1)]), "force": true}))).await;
+}

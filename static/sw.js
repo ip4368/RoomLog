@@ -1,5 +1,5 @@
 // RoomLog service worker: offline app shell; API calls always go to the network.
-const CACHE = 'roomlog-v2';
+const CACHE = 'roomlog-v3';
 const SHELL = ['/', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {

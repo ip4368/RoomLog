@@ -1173,6 +1173,99 @@ function pickList(loan, refs) {
       h('ul', {}, allocs.map((a) => h('li', {}, `${a.quantity} × ${typeName(refs, a.type_id)}`)))]));
 }
 
+/** Is model `typeId` somewhere below kind `kindId`? */
+function modelUnder(refs, typeId, kindId) {
+  let k = refs.types[typeId] ? refs.types[typeId].kind_id : null;
+  for (let depth = 0; k != null && depth < 32; depth++) {
+    if (k === kindId) return true;
+    k = refs.kinds[k] ? refs.kinds[k].parent_id : null;
+  }
+  return false;
+}
+
+/**
+ * "Models to hand out" on a pending loan. Starts from the engine's suggestion;
+ * the AV team can swap models, rooms and quantities. The server checks that the
+ * choice serves the request and that the rooms can spare it.
+ */
+function allocEditor(loan, ev, refs, stock, onChange) {
+  const suggested = new Map(ev.items.map((i) => [wantKey(i), i.allocation]));
+  const owners = groupBy(stock, (s) => s.type_id);
+  const byName = (a, b) => typeName(refs, a).localeCompare(typeName(refs, b));
+  const lendable = (t) => refs.types[t] && refs.types[t].lendable;
+  const lines = [];
+
+  const lineEl = (item) => {
+    const models = item.kind_id != null
+      ? [...owners.keys()].filter((t) => modelUnder(refs, t, item.kind_id))
+        .sort((a, b) => (lendable(b) - lendable(a)) || byName(a, b))
+      : [item.type_id];
+    const rows = h('div');
+    const count = h('span', { class: 'muted small' });
+    const update = () => {
+      const chosen = line.chosen();
+      count.textContent = `${chosen} of ${item.quantity} chosen`;
+      count.style.color = chosen === item.quantity ? '' : 'var(--warn)';
+      onChange();
+    };
+    const addRow = (pick = {}) => {
+      const model = h('select', { 'aria-label': 'Model' }, models.map((t) => h('option', { value: t },
+        typeName(refs, t) + (item.kind_id != null && !lendable(t) ? ' (not normally lent)' : ''))));
+      const room = h('select', { 'aria-label': 'Room' });
+      const qty = h('input', { type: 'number', min: 1, value: pick.qty || 1, 'aria-label': 'Quantity' });
+      const fillRooms = (roomId) => {
+        room.replaceChildren(...(owners.get(+model.value) || []).map((o) =>
+          h('option', { value: o.room_id }, `${roomName(refs, o.room_id)} (owns ${o.quantity})`)));
+        if (roomId != null) room.value = roomId;
+      };
+      if (pick.type_id != null) model.value = pick.type_id;
+      fillRooms(pick.room_id);
+      model.addEventListener('change', () => { fillRooms(); update(); });
+      room.addEventListener('change', update);
+      qty.addEventListener('input', update);
+      const row = h('div', { class: 'item-row' }, model, room, qty,
+        h('button', { type: 'button', class: 'small', title: 'Remove', onclick: () => { row.remove(); update(); } }, '✕'));
+      row.pick = () => ({ room_id: +room.value, type_id: +model.value, quantity: +qty.value });
+      rows.append(row);
+    };
+    const reset = () => {
+      rows.replaceChildren();
+      for (const p of suggested.get(wantKey(item)) || []) addRow(p);
+    };
+    const line = {
+      picks: () => [...rows.children].map((r) => r.pick()).filter((p) => p.room_id && p.type_id && p.quantity > 0),
+      chosen: () => line.picks().reduce((n, p) => n + p.quantity, 0),
+      requested: item.quantity,
+      reset: () => { reset(); update(); },
+    };
+    reset();
+    lines.push(line);
+    update();
+    return h('div', { style: 'margin-bottom:0.8rem' },
+      h('div', { class: 'row' }, h('strong', {}, `${item.quantity} × ${wantName(refs, item)}`), count),
+      rows,
+      models.length
+        ? h('button', { type: 'button', class: 'small', onclick: () => { addRow(); update(); } }, '+ Add')
+        : h('span', { class: 'muted small' }, 'No room owns anything that fits this line.'));
+  };
+
+  const normal = (picks) => JSON.stringify(picks.map((p) => [p.room_id, p.type_id, p.quantity ?? p.qty]).sort());
+  const original = normal(loan.items.flatMap((i) => suggested.get(wantKey(i)) || []));
+  const editor = {
+    get: () => lines.flatMap((l) => l.picks()),
+    total: () => lines.reduce((n, l) => n + l.chosen(), 0),
+    short: () => lines.some((l) => l.chosen() < l.requested),
+    dirty: () => normal(editor.get()) !== original,
+  };
+  const items = loan.items.map(lineEl);
+  editor.el = h('div', { class: 'card no-print' },
+    h('div', { class: 'row' }, h('h2', { style: 'margin:0' }, 'Models to hand out'), h('span', { class: 'spacer' }),
+      h('button', { type: 'button', class: 'small', onclick: () => { lines.forEach((l) => l.reset()); } }, 'Reset to suggestion')),
+    h('p', { class: 'muted small' }, 'Suggested from what each room can spare. Change the models or rooms if you prefer; you will be warned if a room can\'t spare them.'),
+    items);
+  return editor;
+}
+
 async function pageLoan(id) {
   const d = await GET(`/api/loans/${id}`);
   const { loan, refs } = d;
@@ -1202,21 +1295,33 @@ async function pageLoan(id) {
     toast(`Marked ${status}`);
   };
 
+  let editor = null;
   if (loan.status === 'pending' && hasRole('av')) {
-    const ev = d.evaluation;
-    if (ev.fully_available) {
-      act('Approve & reserve', 'primary', async () => {
-        await POST(`/api/loans/${id}/approve`, { message: message.value });
-        toast('Approved');
-      });
-    } else {
-      const canLend = ev.items.some((i) => i.available > 0);
-      if (canLend) act('Approve partial loan', 'primary', async () => {
-        if (!confirm('Not everything is available. Approve and reserve only what is available now?')) return false;
-        await POST(`/api/loans/${id}/approve`, { force: true, message: message.value });
-        toast('Approved (partial)');
-      });
-    }
+    const approveBtn = h('button', { class: 'primary' });
+    const updateApprove = () => {
+      approveBtn.textContent = editor.short() ? 'Approve partial loan' : 'Approve & reserve';
+      approveBtn.disabled = editor.total() === 0;
+    };
+    editor = allocEditor(loan, d.evaluation, refs, d.stock, () => editor && updateApprove());
+    approveBtn.addEventListener('click', busy(approveBtn, async () => {
+      const partial = editor.short();
+      if (partial && !confirm('Not everything requested is chosen. Approve and reserve only the models chosen?')) return;
+      const body = { message: message.value, partial };
+      if (editor.dirty()) body.allocations = editor.get();
+      try {
+        await POST(`/api/loans/${id}/approve`, body);
+      } catch (e) {
+        // A room can't spare what was chosen: overbooking needs an explicit OK.
+        if (e.status !== 409 || !e.body || !Array.isArray(e.body.detail)) throw e;
+        const over = e.body.detail.map((p) => `• ${roomName(refs, p.room_id)}: over by ${p.over} × ${nodeName(refs, p)}`);
+        if (!confirm(`${e.message}:\n${over.join('\n')}\n\nReserve anyway? Church events in those rooms will be short.`)) return;
+        await POST(`/api/loans/${id}/approve`, { ...body, force: true });
+      }
+      toast(partial ? 'Approved (partial)' : 'Approved');
+      reload();
+    }));
+    actions.push(approveBtn);
+    updateApprove();
     act('Decline', 'danger', setStatus('declined', 'Decline this request? Put a reason in the message to the organiser first.'));
   }
   if (!hasRole('av')) { /* read-only view */ } else if (loan.status === 'approved') {
@@ -1271,6 +1376,7 @@ async function pageLoan(id) {
       h('ul', {}, d.allocation_problems.map((p) => h('li', {}, `${roomName(refs, p.room_id)}: over by ${p.over} × ${nodeName(refs, p)}`)))) : null,
 
     d.evaluation ? renderEvaluation(d.evaluation, refs, ctx) : null,
+    editor ? editor.el : null,
     loan.allocations.length && loan.status !== 'pending' ? pickList(loan, refs) : null,
 
     d.agreed_overrides.length ? h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Agreements recorded for this loan'),

@@ -1,6 +1,6 @@
 //! HTTP API (JSON) for the admin console and the public organiser form.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::extract::{Path, Query, State};
@@ -1251,6 +1251,13 @@ async fn loan_detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
     }
 
     let overrides: Vec<db::OverrideRow> = db::load_overrides(&conn)?.into_iter().filter(|o| o.loan_id == Some(id)).collect();
+    // What each room owns, so staff can choose models and rooms before approving.
+    let mut stock: Vec<AllocDto> = if loan.status == "pending" {
+        world.stock.iter().map(|(&(room_id, type_id), &quantity)| AllocDto { room_id, type_id, quantity }).collect()
+    } else {
+        vec![]
+    };
+    stock.sort_by_key(|a| (a.room_id, a.type_id));
 
     Ok(Json(json!({
         "loan": loan,
@@ -1259,6 +1266,7 @@ async fn loan_detail(_: Staff, State(st): State<AppState>, Path(id): Path<Id>) -
         "given": given,
         "competing_pending": competing,
         "agreed_overrides": overrides,
+        "stock": stock,
         "buffer_hours": s.buffer_hours,
         "refs": load_refs(&conn)?,
     })))
@@ -1319,10 +1327,64 @@ struct AllocIn {
 
 #[derive(Deserialize)]
 struct ApproveIn {
+    /// Staff's own choice of models and rooms. Without it the engine's
+    /// suggestion is reserved.
     allocations: Option<Vec<AllocIn>>,
+    /// Accept handing out less than was requested.
+    #[serde(default)]
+    partial: bool,
+    /// Reserve even if a room can't spare it (overbooks church events).
+    /// Implies `partial`.
     #[serde(default)]
     force: bool,
     message: Option<String>,
+}
+
+fn merge_allocations(picks: impl Iterator<Item = (Id, Id, i64)>) -> Vec<(Id, Id, i64)> {
+    let mut merged: BTreeMap<(Id, Id), i64> = BTreeMap::new();
+    for (r, t, q) in picks.filter(|p| p.2 > 0) {
+        *merged.entry((r, t)).or_insert(0) += q;
+    }
+    merged.into_iter().map(|((r, t), q)| (r, t, q)).collect()
+}
+
+/// Staff-chosen allocations must be real stock that serves the request: each
+/// unit a model the room owns, matched to a requested line, and no line given
+/// more than was asked for. Returns, per line, how many units are short.
+fn check_chosen_allocation(
+    refs: &Refs,
+    world: &engine::World,
+    items: &[(Want, i64)],
+    allocations: &[(Id, Id, i64)],
+) -> Result<Vec<i64>, ApiError> {
+    for &(r, t, q) in allocations {
+        let room = refs.rooms.get(&r).ok_or_else(|| ApiError::bad("Unknown room in the allocation"))?;
+        if !refs.types.contains_key(&t) {
+            return Err(ApiError::bad("Unknown equipment in the allocation"));
+        }
+        let owned = world.stock.get(&(r, t)).copied().unwrap_or(0);
+        if q > owned {
+            return Err(ApiError::bad(format!("{room} only has {owned} × {}", refs.type_name(t))));
+        }
+    }
+    let picks: Vec<engine::Pick> =
+        allocations.iter().map(|&(room_id, type_id, qty)| engine::Pick { room_id, type_id, qty }).collect();
+    let given = engine::match_allocation(&world.catalog, items, &picks);
+    let mut used: HashMap<(Id, Id), i64> = HashMap::new();
+    for p in given.iter().flatten() {
+        *used.entry((p.room_id, p.type_id)).or_insert(0) += p.qty;
+    }
+    for &(r, t, q) in allocations {
+        let extra = q - used.get(&(r, t)).copied().unwrap_or(0);
+        if extra > 0 {
+            return Err(ApiError::bad(format!(
+                "{extra} × {} from {} doesn't match anything requested, or is more than was asked for",
+                refs.type_name(t),
+                refs.rooms[&r]
+            )));
+        }
+    }
+    Ok(items.iter().zip(&given).map(|((_, want), g)| want - g.iter().map(|p| p.qty).sum::<i64>()).collect())
 }
 
 async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<Id>, Json(b): Json<ApproveIn>) -> ApiResult<Value> {
@@ -1337,39 +1399,48 @@ async fn approve_loan(staff: Staff, State(st): State<AppState>, Path(id): Path<I
     let window = db::loan_occupancy(loan.pickup_at, loan.return_at, "pending", s.buffer_hours, now);
     let world = db::load_world(&conn, &window, Some(id), s.buffer_hours, now)?;
 
+    let items: Vec<(Want, i64)> = loan.items.iter().map(|i| (i.want, i.quantity)).collect();
+    let partial = b.partial || b.force;
+    let short_error = |short: Vec<Value>| {
+        ApiError::conflict(
+            "Not everything requested is available. Approve a partial loan, or resolve the shortage first.",
+            Some(json!({ "shortfall": short })),
+        )
+    };
     let allocations: Vec<(Id, Id, i64)> = match &b.allocations {
         Some(a) => {
-            let mut merged: BTreeMap<(Id, Id), i64> = BTreeMap::new();
-            for x in a.iter().filter(|x| x.quantity > 0) {
-                *merged.entry((x.room_id, x.type_id)).or_insert(0) += x.quantity;
-            }
-            merged.into_iter().map(|((r, t), q)| (r, t, q)).collect()
-        }
-        None => {
-            let items: Vec<(Want, i64)> = loan.items.iter().map(|i| (i.want, i.quantity)).collect();
-            let ev = engine::evaluate(&world, window, &items);
-            if !ev.fully_available && !b.force {
-                let short: Vec<Value> = ev
-                    .items
-                    .iter()
-                    .filter(|i| i.shortfall > 0)
-                    .map(|i| json!({ "kind_id": i.want.kind_id(), "type_id": i.want.type_id(), "shortfall": i.shortfall }))
-                    .collect();
-                return Err(ApiError::conflict(
-                    "Not everything requested is available. Approve a partial loan, or resolve the shortage first.",
-                    Some(json!({ "shortfall": short })),
+            let allocations = merge_allocations(a.iter().map(|x| (x.room_id, x.type_id, x.quantity)));
+            let short = check_chosen_allocation(&load_refs(&conn)?, &world, &items, &allocations)?;
+            if !partial && short.iter().any(|&s| s > 0) {
+                return Err(short_error(
+                    items
+                        .iter()
+                        .zip(&short)
+                        .filter(|(_, s)| **s > 0)
+                        .map(|((w, _), s)| json!({ "kind_id": w.kind_id(), "type_id": w.type_id(), "shortfall": s }))
+                        .collect(),
                 ));
             }
-            let mut merged: BTreeMap<(Id, Id), i64> = BTreeMap::new();
-            for p in ev.items.iter().flat_map(|i| &i.allocation) {
-                *merged.entry((p.room_id, p.type_id)).or_insert(0) += p.qty;
+            allocations
+        }
+        None => {
+            let ev = engine::evaluate(&world, window, &items);
+            if !ev.fully_available && !partial {
+                return Err(short_error(
+                    ev.items
+                        .iter()
+                        .filter(|i| i.shortfall > 0)
+                        .map(|i| json!({ "kind_id": i.want.kind_id(), "type_id": i.want.type_id(), "shortfall": i.shortfall }))
+                        .collect(),
+                ));
             }
-            merged.into_iter().map(|((r, t), q)| (r, t, q)).collect()
+            merge_allocations(ev.items.iter().flat_map(|i| &i.allocation).map(|p| (p.room_id, p.type_id, p.qty)))
         }
     };
     if allocations.is_empty() {
         return Err(ApiError::conflict("Nothing can be allocated for this request", None));
     }
+    // Only an explicit `force` may overbook; approving a partial loan never does.
     let problems = engine::check_allocation(&world, window, &allocations);
     if !problems.is_empty() && !b.force {
         return Err(ApiError::conflict(
