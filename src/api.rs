@@ -467,6 +467,7 @@ pub fn validate_lines(
         return Err(ApiError::bad("Too many equipment items"));
     }
     let mut merged: BTreeMap<Want, i64> = BTreeMap::new();
+    let catalog = if public { Some(db::load_catalog(conn)?) } else { None };
     for l in lines {
         if !(min_qty..=10_000).contains(&l.quantity) {
             return Err(ApiError::bad(format!("Quantities must be between {min_qty} and 10000")));
@@ -490,6 +491,11 @@ pub fn validate_lines(
                     None => return Err(ApiError::bad("Unknown kind of equipment")),
                     Some((name, false)) => {
                         return Err(ApiError::bad(format!("Please choose something more specific than \"{name}\"")));
+                    }
+                    // "Any of a kind" only draws on lendable models, so the public
+                    // can't ask for a kind with none below it.
+                    Some((name, true)) if catalog.as_ref().is_some_and(|c| !c.lendable.iter().any(|&m| c.serves(l.want, m))) => {
+                        return Err(ApiError::bad(format!("Nothing under \"{name}\" is available for loan")));
                     }
                     _ => {}
                 }

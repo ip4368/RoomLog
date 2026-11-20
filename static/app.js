@@ -342,22 +342,40 @@ const refsCatalog = (refs) => ({
 
 const indent = (depth) => '\u00a0\u00a0\u00a0'.repeat(depth);
 
+/**
+ * Indent tree options only while the list is open: a closed <select> shows the
+ * chosen option's text, which shouldn't start with the indentation.
+ */
+function indentWhenOpen(s) {
+  const label = (o, open) => {
+    if (o.dataset.label != null) o.textContent = (open || !o.selected ? indent(+o.dataset.depth) : '') + o.dataset.label;
+  };
+  const show = (open) => { for (const o of s.options) label(o, open); };
+  s.addEventListener('mousedown', () => show(true));
+  s.addEventListener('change', () => show(false));
+  s.addEventListener('blur', () => show(false));
+  show(false);
+  return s;
+}
+
+const treeOption = (attrs, depth, text) => h('option', { ...attrs, 'data-depth': depth, 'data-label': text }, indent(depth) + text);
+
 /** A <select> of the tree. Requestable kinds read "Name (any)"; other kinds are headings. */
 function wantSelect(catalog, value) {
   const s = h('select', { 'aria-label': 'Equipment' }, h('option', { value: '' }, 'Choose equipment…'));
   for (const r of treeRows(catalog.kinds, catalog.models)) {
     if (r.kind) {
-      s.append(h('option', { value: r.key, disabled: !r.kind.requestable, class: 'kind-option' },
-        indent(r.depth) + r.kind.name + (r.kind.requestable ? ' (any)' : '')));
+      s.append(treeOption({ value: r.key, disabled: !r.kind.requestable, class: 'kind-option' },
+        r.depth, r.kind.name + (r.kind.requestable ? ' (any)' : '')));
     } else {
-      s.append(h('option', { value: r.key }, indent(r.depth) + r.model.name));
+      s.append(treeOption({ value: r.key }, r.depth, r.model.name));
     }
   }
   if (value) {
     if (![...s.options].some((o) => o.value === value && !o.disabled)) s.append(h('option', { value }, 'Other (no longer listed)'));
     s.value = value;
   }
-  return s;
+  return indentWhenOpen(s);
 }
 
 /** Rows of "what × how many". catalog: { kinds, models }. */
