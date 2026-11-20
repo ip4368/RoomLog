@@ -365,6 +365,61 @@ fn migrate_to(conn: &mut Connection, target: usize) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Schema version written by this build (`PRAGMA user_version`).
+pub fn current_schema_version() -> i64 {
+    MIGRATIONS.len() as i64
+}
+
+/// Copies a live database file to `dest` as one consistent snapshot.
+/// Refuses to overwrite; the source is opened without migrating it.
+pub fn backup_database_file(source: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!("No database file at {}", source.display()));
+    }
+    if dest.exists() {
+        return Err(format!("{} already exists; refusing to overwrite", dest.display()));
+    }
+    let conn = Connection::open(source).map_err(|e| e.to_string())?;
+    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Quick schema version read without an integrity check (fleet listings).
+pub fn schema_version_of(path: &std::path::Path) -> Option<i64> {
+    let conn = Connection::open(path).ok()?;
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()
+}
+
+/// Validates a database file for import or use: integrity, a schema version
+/// this build can open, and the tables every released schema has had.
+/// Returns the file's schema version.
+pub fn check_database_file(path: &std::path::Path) -> Result<i64, String> {
+    if !path.is_file() {
+        return Err(format!("No database file at {}", path.display()));
+    }
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if integrity != "ok" {
+        return Err(format!("Integrity check failed: {integrity}"));
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if !(0..=current_schema_version()).contains(&version) {
+        return Err(format!(
+            "Schema version {version} is newer than this RoomLog ({}); upgrade RoomLog first",
+            current_schema_version()
+        ));
+    }
+    for table in ["settings", "rooms", "events", "loans"] {
+        let found: bool = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)", [table], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if !found {
+            return Err(format!("Not a RoomLog database: missing table {table}"));
+        }
+    }
+    Ok(version)
+}
+
 pub fn fmt_dt(dt: NaiveDateTime) -> String {
     dt.format(DT_FMT).to_string()
 }

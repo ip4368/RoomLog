@@ -952,3 +952,37 @@ async fn staff_choose_which_models_go_out() {
     assert_eq!(s, StatusCode::CONFLICT);
     c.ok("POST", &path, Some(json!({"allocations": alloc(&[(youth, sm58, 1)]), "force": true}))).await;
 }
+
+// ---------------------------------------------------------------- fleet mode
+
+fn test_temp_dir(name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("roomlog-{name}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn backup_and_check_round_trip() {
+    let dir = test_temp_dir("backup");
+    let src = dir.join("roomlog.db");
+    let dest = dir.join("snapshot.db");
+    {
+        let conn = db::open(src.to_str().unwrap()).unwrap();
+        conn.execute("INSERT INTO rooms(name) VALUES ('Main Hall')", []).unwrap();
+    }
+    db::backup_database_file(&src, &dest).unwrap();
+    assert_eq!(db::check_database_file(&dest).unwrap(), db::current_schema_version());
+    let conn = db::open(dest.to_str().unwrap()).unwrap();
+    let name: String = conn.query_row("SELECT name FROM rooms", [], |r| r.get(0)).unwrap();
+    assert_eq!(name, "Main Hall");
+    drop(conn);
+
+    // Refusals: overwrite, missing source, and a file that is not a database.
+    assert!(db::backup_database_file(&src, &dest).is_err());
+    assert!(db::check_database_file(&dir.join("missing.db")).is_err());
+    let junk = dir.join("junk.db");
+    std::fs::write(&junk, b"not a database").unwrap();
+    assert!(db::check_database_file(&junk).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
