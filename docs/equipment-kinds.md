@@ -252,6 +252,10 @@ One new entry in `MIGRATIONS`, applied in a transaction like the others:
 4. **Don't rebuild `equipment_types`**: with `foreign_keys = ON`, dropping it would
    cascade-delete all stock, needs and allocations. `ADD COLUMN` and `DROP COLUMN` are enough.
 
+Dropping `category` can't be undone, so `db::open` copies an existing database to
+`<file>.v<N>-backup-<time>` (with `VACUUM INTO`) before applying any migration. If the copy
+fails, nothing is migrated.
+
 Immediately after the migration nothing behaves differently: no kind is requestable yet, and
 every existing line names a model. The AV team then builds out the tree (adds "Vocal mic",
 "Wired vocal mic", moves models in, ticks *requestable*). Whoever owns each church event can

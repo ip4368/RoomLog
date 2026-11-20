@@ -317,9 +317,28 @@ pub fn load_catalog(conn: &Connection) -> rusqlite::Result<Catalog> {
 
 pub fn open(path: &str) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open(path)?;
+    backup_before_upgrade(&conn, path)?;
     conn.execute_batch(SCHEMA)?;
     migrate(&mut conn)?;
     Ok(conn)
+}
+
+/// Some upgrades can't be undone (migration 3 drops a column), so before an
+/// existing database is migrated it is copied to `<path>.v<version>-backup-<time>`.
+/// If the copy fails, nothing is migrated.
+fn backup_before_upgrade(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    if path.is_empty() || path == ":memory:" {
+        return Ok(());
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let has_data: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table')", [], |r| r.get(0))?;
+    if !has_data || usize::try_from(version).unwrap_or(0) >= MIGRATIONS.len() {
+        return Ok(());
+    }
+    let dest = format!("{path}.v{version}-backup-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    conn.execute("VACUUM INTO ?1", [&dest])?;
+    tracing::info!("Upgrading {path} from schema version {version}; a copy of the old database is in {dest}");
+    Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {

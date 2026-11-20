@@ -30,7 +30,7 @@ ADMIN_PASSWORD='choose-a-good-password' DATABASE_PATH=roomlog.db ./target/releas
 | Environment variable | Default        | Meaning                                                       |
 |----------------------|----------------|---------------------------------------------------------------|
 | `ADMIN_PASSWORD`     | *(first run)*  | Creates the first staff account, `admin`, with this password (min 8 chars). Ignored once accounts exist. |
-| `DATABASE_PATH`      | `roomlog.db`   | SQLite file. Back this file up (it's the whole system).       |
+| `DATABASE_PATH`      | `roomlog.db`   | SQLite file. Back this file up (it's the whole system). Before a new version upgrades it, a copy of the old file is saved next to it as `<file>.v<N>-backup-<time>`. |
 | `BIND`               | `0.0.0.0:8080` | Listen address                                                |
 | `COOKIE_SECURE`      | off            | Set to `1` when served over HTTPS (recommended)               |
 
@@ -39,6 +39,11 @@ ADMIN_PASSWORD='choose-a-good-password' DATABASE_PATH=roomlog.db ./target/releas
 > `roomlog.db` when convenient. The shared password is replaced by individual staff accounts:
 > on first start your existing `ADMIN_PASSWORD` becomes the `admin` account's password. Log in
 > as `admin` and add everyone else under **Users**.
+
+> **Going back to a release from before equipment kinds:** that upgrade drops the old
+> `category` column. With RoomLog stopped, `python3 tools/downgrade_v3_to_v2.py roomlog.db`
+> restores the version 2 layout (each model's category becomes its top-level kind). It refuses
+> if any request or need asks for "any of a kind", since version 2 can't express that.
 
 ### Staff accounts
 
@@ -153,7 +158,8 @@ overlaps something still works (it may be intended), but staff are shown the cla
 
 ```sh
 cargo test          # engine, recurrence and end-to-end API tests
-cargo run -- seed-demo && ADMIN_PASSWORD=devpassword cargo run
+# Use a separate demo database so your real roomlog.db is never touched (or upgraded)
+DATABASE_PATH=demo.db cargo run -- seed-demo && DATABASE_PATH=demo.db ADMIN_PASSWORD=devpassword cargo run
 ```
 
 * `src/engine.rs`: pure equipment availability/allocation/negotiation logic over the kind tree (unit-tested)

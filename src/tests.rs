@@ -63,6 +63,24 @@ impl Client {
     }
 }
 
+/// Backups the upgrade made of the database at `path`.
+fn backups_of(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let prefix = format!("{}.v", path.file_name().unwrap().to_str().unwrap());
+    std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with(&prefix))
+        .collect()
+}
+
+/// Removes a test database and any backups of it.
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    for b in backups_of(path) {
+        let _ = std::fs::remove_file(b);
+    }
+}
+
 fn next_sunday() -> NaiveDate {
     let mut d = Local::now().date_naive() + Duration::days(1);
     while d.weekday() != Weekday::Sun {
@@ -414,7 +432,7 @@ async fn staff_roles_are_enforced() {
 fn migrations_upgrade_a_pre_accounts_database() {
     // A database from before staff accounts: old sessions table, user_version 0.
     let path = std::env::temp_dir().join(format!("roomlog-migrate-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -432,9 +450,11 @@ fn migrations_upgrade_a_pre_accounts_database() {
     assert_eq!(rooms, 1, "existing data is kept");
     assert_eq!(auth::user_count(&conn).unwrap(), 0);
     drop(conn);
-    // Re-opening is a no-op.
+    assert_eq!(backups_of(&path).len(), 1, "the old database was copied before upgrading");
+    // Re-opening is a no-op, and makes no further backups.
     db::open(path.to_str().unwrap()).unwrap();
-    let _ = std::fs::remove_file(&path);
+    assert_eq!(backups_of(&path).len(), 1);
+    remove_db(&path);
 }
 
 fn at(d: NaiveDate, hm: &str) -> String {
@@ -664,7 +684,7 @@ async fn room_booking_workflow() {
 #[test]
 fn migration_3_turns_categories_into_kinds_and_keeps_everything() {
     let path = std::env::temp_dir().join(format!("roomlog-migrate3-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
     {
         let conn = db::open_at_version(path.to_str().unwrap(), 2).unwrap();
         conn.execute_batch(
@@ -709,7 +729,17 @@ fn migration_3_turns_categories_into_kinds_and_keeps_everything() {
     assert_eq!(fk, 0);
     drop(conn);
     db::open(path.to_str().unwrap()).unwrap();
-    let _ = std::fs::remove_file(&path);
+
+    // The pre-upgrade copy is the untouched version 2 database.
+    let backups = backups_of(&path);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let old = rusqlite::Connection::open(&backups[0]).unwrap();
+    let version: i64 = old.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 2);
+    let category: String = old.query_row("SELECT category FROM equipment_types WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(category, "Mics");
+    drop(old);
+    remove_db(&path);
 }
 
 #[tokio::test]
