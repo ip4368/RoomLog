@@ -1116,3 +1116,82 @@ fn backup_all_verify_and_drill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+struct ControlClient {
+    app: Router,
+    token: Option<String>,
+}
+
+impl ControlClient {
+    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(t) = &self.token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = match body {
+            Some(b) => req.header(header::CONTENT_TYPE, "application/json").body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+}
+
+#[tokio::test]
+async fn control_plane_lifecycle() {
+    let dir = test_temp_dir("control");
+    let router = fleet::fleet_app(
+        fleet::FleetState::new(dir.clone(), Some("example.com".into()), false, 4).with_control(Some("secret-token".into()), "cell-test".into()),
+    );
+    let anon = ControlClient { app: router.clone(), token: None };
+    let wrong = ControlClient { app: router.clone(), token: Some("nope".into()) };
+    let admin = ControlClient { app: router.clone(), token: Some("secret-token".into()) };
+    assert_eq!(anon.call("GET", "/api/control/health", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong.call("GET", "/api/control/health", None).await.0, StatusCode::UNAUTHORIZED);
+    let (s, v) = admin.call("GET", "/api/control/health", None).await;
+    assert_eq!((s, v["cell"].as_str(), v["tenants"].as_i64()), (StatusCode::OK, Some("cell-test"), Some(0)));
+
+    // Signup provisions a working church; the initial password comes back once.
+    let (s, v) = admin
+        .call("POST", "/api/control/tenants", Some(json!({"slug": "trinity", "church_name": "Trinity Church", "contact_email": "office@trinity.example"})))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let password = v["admin_password"].as_str().unwrap().to_string();
+    assert!(password.len() >= 8);
+    let (s, _) = admin.call("POST", "/api/control/tenants", Some(json!({"slug": "trinity"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, _) = admin.call("POST", "/api/control/tenants", Some(json!({"slug": "Bad Slug!"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let mut church = FleetClient { app: router.clone(), host: "trinity.example.com".into(), cookie: None };
+    let info = church.ok("GET", "/api/public/info", None).await;
+    assert_eq!(info["church_name"], "Trinity Church");
+    church.ok("POST", "/api/login", Some(json!({"username": "admin", "password": password}))).await;
+    church.ok("POST", "/api/rooms", Some(json!({"name": "Hall"}))).await;
+
+    let (s, v) = admin.call("POST", "/api/control/tenants/trinity/backup", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(std::path::Path::new(v["backup"].as_str().unwrap()).is_file());
+    let (s, v) = admin.call("POST", "/api/control/tenants/trinity/restore-drill", None).await;
+    assert_eq!((s, v["rooms"].as_i64()), (StatusCode::OK, Some(1)), "{v}");
+    let (_, v) = admin.call("GET", "/api/control/tenants", None).await;
+    assert_eq!(v[0]["contact_email"], "office@trinity.example");
+
+    // Suspension cuts service without deleting data; resume restores it.
+    admin.call("POST", "/api/control/tenants/trinity/suspend", None).await;
+    assert_eq!(church.call("GET", "/api/public/info", None).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    admin.call("POST", "/api/control/tenants/trinity/resume", None).await;
+    assert_eq!(church.call("GET", "/api/public/info", None).await.0, StatusCode::OK);
+
+    assert_eq!(admin.call("DELETE", "/api/control/tenants/trinity", None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(admin.call("DELETE", "/api/control/tenants/trinity?confirm=trinity", None).await.0, StatusCode::OK);
+    assert_eq!(church.call("GET", "/api/public/info", None).await.0, StatusCode::NOT_FOUND);
+
+    // Without a configured token the control plane does not exist.
+    let plain = fleet::fleet_app(fleet::FleetState::new(dir.clone(), Some("example.com".into()), false, 4));
+    let c = ControlClient { app: plain, token: Some("secret-token".into()) };
+    assert_eq!(c.call("GET", "/api/control/health", None).await.0, StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_dir_all(&dir);
+}

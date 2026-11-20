@@ -274,7 +274,10 @@ async fn main() {
             let max_open = std::env::var("MAX_OPEN_TENANTS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
             let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| die(format!("Failed to bind {bind}: {e}")));
             tracing::info!("RoomLog fleet listening on http://{bind} (tenants: {})", dir.display());
-            axum::serve(listener, fleet::fleet_app(fleet::FleetState::new(dir, base_domain, cookie_secure, max_open)))
+            let admin_token = std::env::var("FLEET_ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
+            let cell_id = std::env::var("CELL_ID").ok().filter(|c| !c.is_empty()).unwrap_or_else(|| "cell-1".into());
+            let fleet_state = fleet::FleetState::new(dir, base_domain, cookie_secure, max_open).with_control(admin_token, cell_id);
+            axum::serve(listener, fleet::fleet_app(fleet_state))
                 .await
                 .expect("server error");
             return;

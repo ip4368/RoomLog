@@ -13,10 +13,10 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::extract::{Path as AxPath, Query, State};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
@@ -381,6 +381,8 @@ pub struct FleetState {
     base_domain: Option<String>,
     cookie_secure: bool,
     max_open: usize,
+    admin_token: Option<String>,
+    cell_id: String,
     tenants: Arc<Mutex<HashMap<String, TenantEntry>>>,
 }
 
@@ -391,8 +393,28 @@ impl FleetState {
             base_domain,
             cookie_secure,
             max_open: max_open.max(1),
+            admin_token: None,
+            cell_id: "cell-1".into(),
             tenants: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Enables the hosted control-plane API (`/api/control/*`, bearer token)
+    /// and names the cell this fleet process serves.
+    pub fn with_control(mut self, admin_token: Option<String>, cell_id: String) -> Self {
+        self.admin_token = admin_token.filter(|t| !t.is_empty());
+        if !cell_id.is_empty() {
+            self.cell_id = cell_id;
+        }
+        self
+    }
+
+    pub fn evict(&self, slug: &str) {
+        self.tenants.lock().unwrap_or_else(|e| e.into_inner()).remove(slug);
+    }
+
+    fn open_count(&self) -> usize {
+        self.tenants.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// The tenant's app, opened on first use. `None` when the tenant has no
@@ -418,8 +440,8 @@ impl FleetState {
     }
 }
 
-async fn fleet_health() -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "ok": true, "mode": "fleet" }))
+async fn fleet_health(State(fleet): State<FleetState>) -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "ok": true, "mode": "fleet", "cell": fleet.cell_id }))
 }
 
 async fn dispatch(State(fleet): State<FleetState>, req: Request<Body>) -> Response {
@@ -443,8 +465,186 @@ async fn dispatch(State(fleet): State<FleetState>, req: Request<Body>) -> Respon
     }
 }
 
+// --------------------------------------------------------- control plane
+//
+// Hosted-operator API under `/api/control/*`. Enabled only when a fleet
+// admin token is configured; every call needs `Authorization: Bearer <token>`.
+// The app binary never requires it, and single-church installs never see it.
+
+fn control_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, axum::Json(serde_json::json!({ "error": msg.into() }))).into_response()
+}
+
+#[allow(clippy::result_large_err)] // an axum Response as the error is the point here
+fn require_admin(fleet: &FleetState, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(expected) = &fleet.admin_token else {
+        return Err(control_error(StatusCode::NOT_FOUND, "Not found"));
+    };
+    let given = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    match given {
+        Some(g) if g == expected => Ok(()),
+        _ => Err(control_error(StatusCode::UNAUTHORIZED, "Fleet admin token required")),
+    }
+}
+
+async fn control_health(State(fleet): State<FleetState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    // Cheap aggregates only (stat, no database opens) so health stays fast
+    // with many idle tenants on disk.
+    let slugs = list_tenants(&fleet.tenants_dir);
+    let total_db_bytes: u64 = slugs.iter().map(|s| std::fs::metadata(tenant_db_path(&fleet.tenants_dir, s)).map(|m| m.len()).unwrap_or(0)).sum();
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "cell": fleet.cell_id,
+        "tenants": slugs.len(),
+        "open_tenants": fleet.open_count(),
+        "max_open_tenants": fleet.max_open,
+        "total_db_bytes": total_db_bytes,
+        "suspended": slugs.iter().filter(|s| is_suspended(&fleet.tenants_dir, s)).count(),
+    }))
+    .into_response()
+}
+
+async fn control_list(State(fleet): State<FleetState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    let infos: Vec<TenantInfo> = list_tenants(&fleet.tenants_dir).iter().map(|s| tenant_info(&fleet.tenants_dir, s)).collect();
+    axum::Json(infos).into_response()
+}
+
+#[derive(Deserialize)]
+struct SignupIn {
+    slug: String,
+    #[serde(default)]
+    church_name: String,
+    #[serde(default)]
+    contact_email: String,
+    /// Omit to have an initial admin password generated and returned once.
+    #[serde(default)]
+    admin_password: Option<String>,
+}
+
+async fn control_create(State(fleet): State<FleetState>, headers: HeaderMap, axum::Json(b): axum::Json<SignupIn>) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    let generated = crate::api::random_token(20);
+    let password = b.admin_password.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&generated);
+    match create_tenant_with_meta(&fleet.tenants_dir, &b.slug, password, &b.church_name, &b.contact_email) {
+        Ok(_) => (
+            StatusCode::CREATED,
+            axum::Json(serde_json::json!({
+                "slug": b.slug,
+                "cell": fleet.cell_id,
+                "admin_username": "admin",
+                "admin_password": password,
+            })),
+        )
+            .into_response(),
+        Err(e) if e.contains("already exists") => control_error(StatusCode::CONFLICT, e),
+        Err(e) => control_error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn control_suspend(State(fleet): State<FleetState>, headers: HeaderMap, AxPath(slug): AxPath<String>) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    match set_suspended(&fleet.tenants_dir, &slug, true) {
+        Ok(()) => {
+            fleet.evict(&slug);
+            axum::Json(serde_json::json!({ "ok": true, "slug": slug, "suspended": true })).into_response()
+        }
+        Err(e) => control_error(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn control_resume(State(fleet): State<FleetState>, headers: HeaderMap, AxPath(slug): AxPath<String>) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    match set_suspended(&fleet.tenants_dir, &slug, false) {
+        Ok(()) => axum::Json(serde_json::json!({ "ok": true, "slug": slug, "suspended": false })).into_response(),
+        Err(e) => control_error(StatusCode::NOT_FOUND, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteQuery {
+    #[serde(default)]
+    confirm: String,
+}
+
+async fn control_delete(
+    State(fleet): State<FleetState>,
+    headers: HeaderMap,
+    AxPath(slug): AxPath<String>,
+    Query(q): Query<DeleteQuery>,
+) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    if q.confirm != slug {
+        return control_error(StatusCode::BAD_REQUEST, "Pass ?confirm=<slug> to delete a tenant");
+    }
+    match delete_tenant(&fleet.tenants_dir, &slug) {
+        Ok(()) => {
+            fleet.evict(&slug);
+            axum::Json(serde_json::json!({ "ok": true, "deleted": slug })).into_response()
+        }
+        Err(e) => control_error(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn control_backup(State(fleet): State<FleetState>, headers: HeaderMap, AxPath(slug): AxPath<String>) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    let dir = fleet.tenants_dir.join("_backups");
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let dest = dir.join(format!("{slug}-{stamp}.db"));
+    let made = std::fs::create_dir_all(&dir).map_err(|e| e.to_string())
+        .and_then(|()| db::backup_database_file(&tenant_db_path(&fleet.tenants_dir, &slug), &dest))
+        .and_then(|()| db::check_database_file(&dest));
+    match made {
+        Ok(version) => axum::Json(serde_json::json!({
+            "slug": slug,
+            "backup": dest.to_string_lossy(),
+            "schema_version": version,
+            "bytes": std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
+        }))
+        .into_response(),
+        Err(e) => control_error(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn control_drill(State(fleet): State<FleetState>, headers: HeaderMap, AxPath(slug): AxPath<String>) -> Response {
+    if let Err(r) = require_admin(&fleet, &headers) {
+        return r;
+    }
+    let dir = fleet.tenants_dir.clone();
+    match tokio::task::spawn_blocking(move || restore_drill(&dir, &slug)).await {
+        Ok(Ok(report)) => axum::Json(report).into_response(),
+        Ok(Err(e)) => control_error(StatusCode::NOT_FOUND, e),
+        Err(e) => control_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 /// The fleet HTTP app: tenant dispatch for everything, plus a tenant-free
-/// health check for load balancers.
+/// health check for load balancers and the operator control-plane routes.
 pub fn fleet_app(state: FleetState) -> Router {
-    Router::new().route("/healthz", get(fleet_health)).fallback(dispatch).with_state(state)
+    Router::new()
+        .route("/healthz", get(fleet_health))
+        .route("/api/control/health", get(control_health))
+        .route("/api/control/tenants", get(control_list).post(control_create))
+        .route("/api/control/tenants/{slug}", axum::routing::delete(control_delete))
+        .route("/api/control/tenants/{slug}/suspend", post(control_suspend))
+        .route("/api/control/tenants/{slug}/resume", post(control_resume))
+        .route("/api/control/tenants/{slug}/backup", post(control_backup))
+        .route("/api/control/tenants/{slug}/restore-drill", post(control_drill))
+        .fallback(dispatch)
+        .with_state(state)
 }
