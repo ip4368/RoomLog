@@ -219,6 +219,142 @@ pub fn import_tenant(tenants_dir: &Path, slug: &str, source: &Path) -> Result<Pa
     Ok(db_path)
 }
 
+// ------------------------------------------------------------- backup sets
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupEntry {
+    pub slug: String,
+    pub file: String,
+    pub schema_version: i64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BackupManifest {
+    created_at: String,
+    entries: Vec<BackupEntry>,
+}
+
+/// Snapshots every tenant into `dest_dir` (`<slug>.db` each) and writes
+/// `manifest.json` recording version and size per file.
+pub fn backup_all(tenants_dir: &Path, dest_dir: &Path) -> Result<Vec<BackupEntry>, String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for slug in list_tenants(tenants_dir) {
+        let file = format!("{slug}.db");
+        let dest = dest_dir.join(&file);
+        db::backup_database_file(&tenant_db_path(tenants_dir, &slug), &dest)?;
+        entries.push(BackupEntry {
+            slug,
+            schema_version: db::check_database_file(&dest)?,
+            bytes: std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
+            file,
+        });
+    }
+    let manifest = BackupManifest { created_at: db::fmt_dt(crate::api::now()), entries: entries.clone() };
+    std::fs::write(dest_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(entries)
+}
+
+/// Re-validates every file named by a backup set's manifest (integrity,
+/// version, size). Fails naming the first bad tenant.
+pub fn verify_backups(dest_dir: &Path) -> Result<Vec<BackupEntry>, String> {
+    let raw = std::fs::read_to_string(dest_dir.join("manifest.json")).map_err(|e| format!("No readable manifest.json: {e}"))?;
+    let manifest: BackupManifest = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    for entry in &manifest.entries {
+        let path = dest_dir.join(&entry.file);
+        let version = db::check_database_file(&path).map_err(|e| format!("{}: {e}", entry.slug))?;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if version != entry.schema_version || bytes != entry.bytes {
+            return Err(format!("{}: backup differs from manifest (version {version}, {bytes} bytes)", entry.slug));
+        }
+    }
+    Ok(manifest.entries)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DrillReport {
+    pub slug: String,
+    pub schema_version: i64,
+    pub rooms: i64,
+    pub users: i64,
+    pub events: i64,
+}
+
+fn db_counts(path: &Path) -> Result<(i64, i64, i64), String> {
+    let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+    let count = |table: &str| conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string());
+    Ok((count("rooms")?, count("users")?, count("events")?))
+}
+
+fn drill_snapshot(snapshot: &Path, slug: &str) -> Result<DrillReport, String> {
+    let expected = db_counts(snapshot)?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let scratch = std::env::temp_dir().join(format!("roomlog-drill-{}-{nanos}", std::process::id()));
+    let tenants = scratch.join("tenants");
+    let result = import_tenant(&tenants, slug, snapshot).and_then(|restored| {
+        let actual = db_counts(&restored)?;
+        if actual != expected {
+            return Err(format!("Restored counts {actual:?} differ from snapshot {expected:?}"));
+        }
+        Ok(DrillReport {
+            slug: slug.to_string(),
+            schema_version: db::check_database_file(&restored)?,
+            rooms: actual.0,
+            users: actual.1,
+            events: actual.2,
+        })
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Restore drill for one tenant: snapshot it, import the snapshot into a
+/// scratch fleet, and confirm the restored data matches. The live tenant is
+/// never touched and the scratch copy is deleted either way.
+pub fn restore_drill(tenants_dir: &Path, slug: &str) -> Result<DrillReport, String> {
+    if !valid_slug(slug) || !tenant_db_path(tenants_dir, slug).is_file() {
+        return Err(format!("Unknown tenant {slug}"));
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let snapshot = std::env::temp_dir().join(format!("roomlog-drill-snap-{slug}-{}-{nanos}.db", std::process::id()));
+    db::backup_database_file(&tenant_db_path(tenants_dir, slug), &snapshot)?;
+    let report = drill_snapshot(&snapshot, slug);
+    let _ = std::fs::remove_file(&snapshot);
+    report
+}
+
+/// Restore drill for a standalone backup file (single-church snapshots).
+pub fn restore_drill_file(backup: &Path) -> Result<DrillReport, String> {
+    db::check_database_file(backup)?;
+    drill_snapshot(backup, "drill")
+}
+
+fn yaml_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// Litestream config replicating every tenant file under `tenants_dir`
+/// (directory mode: new tenants are picked up by the watcher).
+pub fn litestream_config_fleet(tenants_dir: &Path, meta_dir: &Path, replica_url: &str) -> String {
+    format!(
+        "# Generated by `roomlog backup-config`. Regenerate if paths change.\ndbs:\n  - dir: {}\n    pattern: \"roomlog.db\"\n    recursive: true\n    watch: true\n    meta-dir: {}\n    replica:\n      url: {}\n",
+        yaml_str(&tenants_dir.to_string_lossy()),
+        yaml_str(&meta_dir.to_string_lossy()),
+        yaml_str(replica_url),
+    )
+}
+
+/// Litestream config for one single-church database file.
+pub fn litestream_config_single(db_path: &Path, replica_url: &str) -> String {
+    format!(
+        "# Generated by `roomlog backup-config`.\ndbs:\n  - path: {}\n    replicas:\n      - url: {}\n",
+        yaml_str(&db_path.to_string_lossy()),
+        yaml_str(replica_url),
+    )
+}
+
 /// Tenant slugs that have a database on disk, sorted.
 pub fn list_tenants(tenants_dir: &Path) -> Vec<String> {
     let mut slugs: Vec<String> = std::fs::read_dir(tenants_dir)

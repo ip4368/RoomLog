@@ -118,7 +118,12 @@ Usage:
   roomlog tenant-create <slug>              create a fleet tenant (TENANTS_DIR, ADMIN_PASSWORD)
   roomlog tenant-list                       list fleet tenants (TENANTS_DIR)
   roomlog tenant-backup <slug> <dest.db>    snapshot one fleet tenant (TENANTS_DIR)
-  roomlog tenant-import <slug> <file.db>    import a database file as a new tenant (TENANTS_DIR)";
+  roomlog tenant-import <slug> <file.db>    import a database file as a new tenant (TENANTS_DIR)
+  roomlog tenant-backup-all <dest-dir>      snapshot every tenant + manifest.json (TENANTS_DIR)
+  roomlog verify-backups <backup-dir>       re-validate a backup set against its manifest
+  roomlog restore-drill <slug|file.db>      prove a snapshot restores (TENANTS_DIR => slug)
+  roomlog tenant-versions                   schema version per tenant (TENANTS_DIR)
+  roomlog backup-config <replica-url>       print a Litestream config (fleet or single database)";
 
 fn die(msg: String) -> ! {
     eprintln!("{msg}");
@@ -131,6 +136,12 @@ fn tenants_dir() -> Option<std::path::PathBuf> {
 
 fn require_tenants_dir() -> std::path::PathBuf {
     tenants_dir().unwrap_or_else(|| die("Set TENANTS_DIR to the fleet root for tenant commands".into()))
+}
+
+fn abs_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(path) }
+    })
 }
 
 /// Commands that work on files/fleets without opening the single database.
@@ -184,6 +195,56 @@ fn run_file_command(args: &[String]) -> bool {
             match fleet::import_tenant(&require_tenants_dir(), slug, std::path::Path::new(source)) {
                 Ok(p) => println!("Tenant {slug} imported at {}", p.display()),
                 Err(e) => die(e),
+            }
+        }
+        Some("tenant-backup-all") => {
+            let Some(dest) = args.get(2) else { die("Usage: roomlog tenant-backup-all <dest-dir>".into()) };
+            match fleet::backup_all(&require_tenants_dir(), std::path::Path::new(dest)) {
+                Ok(entries) => println!("Snapshotted {} tenants into {dest} (manifest.json written)", entries.len()),
+                Err(e) => die(e),
+            }
+        }
+        Some("verify-backups") => {
+            let Some(dir) = args.get(2) else { die("Usage: roomlog verify-backups <backup-dir>".into()) };
+            match fleet::verify_backups(std::path::Path::new(dir)) {
+                Ok(entries) => println!("OK: {} backups in {dir} verify against the manifest", entries.len()),
+                Err(e) => die(e),
+            }
+        }
+        Some("restore-drill") => {
+            let Some(target) = args.get(2) else { die("Usage: roomlog restore-drill <slug|file.db>".into()) };
+            let report = match tenants_dir() {
+                Some(dir) => fleet::restore_drill(&dir, target),
+                None => fleet::restore_drill_file(std::path::Path::new(target)),
+            };
+            match report {
+                Ok(r) => println!(
+                    "Restore drill OK for {}: schema v{}, {} rooms, {} users, {} events",
+                    r.slug, r.schema_version, r.rooms, r.users, r.events
+                ),
+                Err(e) => die(e),
+            }
+        }
+        Some("tenant-versions") => {
+            let dir = require_tenants_dir();
+            for slug in fleet::list_tenants(&dir) {
+                let version = db::schema_version_of(&fleet::tenant_db_path(&dir, &slug));
+                let state = if fleet::is_suspended(&dir, &slug) { " suspended" } else { "" };
+                println!("{slug} v{}{state}", version.map_or_else(|| "?".into(), |v| v.to_string()));
+            }
+        }
+        Some("backup-config") => {
+            let Some(replica) = args.get(2) else { die("Usage: roomlog backup-config <replica-url>".into()) };
+            match tenants_dir() {
+                Some(dir) => {
+                    let dir = abs_path(&dir);
+                    let meta = dir.parent().map(|p| p.join("litestream-meta")).unwrap_or_else(|| dir.join(".litestream-meta"));
+                    print!("{}", fleet::litestream_config_fleet(&dir, &meta, replica));
+                }
+                None => {
+                    let source = std::env::var("DATABASE_PATH").unwrap_or_else(|_| default_db_path());
+                    print!("{}", fleet::litestream_config_single(&abs_path(std::path::Path::new(&source)), replica));
+                }
             }
         }
         _ => return false,

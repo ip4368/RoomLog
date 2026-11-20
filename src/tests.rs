@@ -1082,3 +1082,37 @@ async fn fleet_tenants_are_isolated() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn backup_all_verify_and_drill() {
+    let dir = test_temp_dir("backup-all");
+    fleet::create_tenant(&dir, "st-marys", "correct horse").unwrap();
+    fleet::create_tenant(&dir, "st-pauls", "correct horse").unwrap();
+    {
+        let conn = db::open(fleet::tenant_db_path(&dir, "st-marys").to_str().unwrap()).unwrap();
+        conn.execute("INSERT INTO rooms(name) VALUES ('Main Hall')", []).unwrap();
+    }
+    let backups = dir.join("backup-set");
+    let entries = fleet::backup_all(&dir, &backups).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(backups.join("manifest.json").is_file());
+    assert_eq!(fleet::verify_backups(&backups).unwrap().len(), 2);
+
+    let report = fleet::restore_drill(&dir, "st-marys").unwrap();
+    assert_eq!((report.rooms, report.users, report.schema_version), (1, 1, db::current_schema_version()));
+    let file_report = fleet::restore_drill_file(&backups.join("st-pauls.db")).unwrap();
+    assert_eq!(file_report.rooms, 0);
+    assert!(fleet::restore_drill(&dir, "nobody").is_err());
+
+    // A tampered backup must fail verification, naming the tenant.
+    let mut bytes = std::fs::read(backups.join("st-marys.db")).unwrap();
+    bytes.extend_from_slice(b"tampered");
+    std::fs::write(backups.join("st-marys.db"), bytes).unwrap();
+    let err = fleet::verify_backups(&backups).unwrap_err();
+    assert!(err.contains("st-marys"), "{err}");
+
+    // Generated replication configs name the right paths and replica.
+    let cfg = fleet::litestream_config_fleet(&dir, &dir.join("meta"), "s3://bucket/roomlog");
+    assert!(cfg.contains("roomlog.db") && cfg.contains("s3://bucket/roomlog") && cfg.contains("watch: true"), "{cfg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
