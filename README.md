@@ -33,6 +33,19 @@ ADMIN_PASSWORD='choose-a-good-password' DATABASE_PATH=roomlog.db ./target/releas
 | `DATABASE_PATH`      | `roomlog.db`   | SQLite file. Back this file up (it's the whole system). Before a new version upgrades it, a copy of the old file is saved next to it as `<file>.v<N>-backup-<time>`. |
 | `BIND`               | `0.0.0.0:8080` | Listen address                                                |
 | `COOKIE_SECURE`      | off            | Set to `1` when served over HTTPS (recommended)               |
+| `TENANTS_DIR`        | *(unset)*      | Fleet mode for hosts serving many churches: one `<slug>/roomlog.db` per church, chosen by subdomain. Don't set together with `DATABASE_PATH`. See [deployment](docs/deployment.md) |
+| `BASE_DOMAIN`        | *(any host)*   | Fleet only: only `<slug>.<BASE_DOMAIN>` hosts resolve to a church |
+| `MAX_OPEN_TENANTS`   | `128`          | Fleet only: tenant databases kept open at once (least recently used closes). Size above the simultaneous active set |
+| `FLEET_ADMIN_TOKEN`  | *(unset)*      | Fleet only: enables the hosted control-plane API under `/api/control/*` (bearer token) |
+| `CELL_ID`            | `cell-1`       | Fleet only: name of the cell this process serves |
+| `CELLS_DIR`          | *(unset)*      | Cell directory root for `cell-*` commands (slug → cell routing) |
+
+**Packaged self-host:** `SITE_ADDRESS=rooms.example.org ADMIN_PASSWORD='…' docker compose up -d`
+runs RoomLog behind Caddy with automatic HTTPS and the database in a volume.
+Snapshot the database any time with `roomlog backup <file>`; validate a file
+before moving it with `roomlog check-database <file>`. Hosted (many churches)
+and self-hosted use the same binary and file format — moving a church is
+moving its file. Modes, tiers and fleet commands: [docs/deployment.md](docs/deployment.md).
 
 > **Upgrading from Quippy:** the project was renamed. If `DATABASE_PATH` isn't set and only
 > the old `quippy.db` exists, RoomLog keeps using it (and says so at startup); rename the file to
@@ -173,6 +186,9 @@ DATABASE_PATH=demo.db cargo run -- seed-demo && DATABASE_PATH=demo.db ADMIN_PASS
 * `src/auth.rs`: staff accounts, roles and sessions
 * `src/bookings.rs`: room booking API (staff + public)
 * `src/api.rs`: the rest of the JSON API (admin + public)
+* `src/fleet.rs`: fleet mode (subdomain routing, lazy tenant-pool, provisioning, control-plane API, backup sets/drills) — see `docs/deployment.md`
+* `src/cells.rs`: cells (slug → cell directory, assignment, tenant moves, edge routes)
+* `tools/fleet_load.py`: fleet load harness for the mostly-idle-tenant capacity model
 * `docs/room-booking.md`: why bookings work the way they do
 * `docs/equipment-kinds.md`: equipment kinds (the tree) and how availability works over it
 * `static/`: the PWA (vanilla JS, no build step), embedded into the binary at compile time
