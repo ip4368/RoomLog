@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod bookings;
+mod cells;
 mod clash;
 mod db;
 mod demo;
@@ -123,7 +124,13 @@ Usage:
   roomlog verify-backups <backup-dir>       re-validate a backup set against its manifest
   roomlog restore-drill <slug|file.db>      prove a snapshot restores (TENANTS_DIR => slug)
   roomlog tenant-versions                   schema version per tenant (TENANTS_DIR)
-  roomlog backup-config <replica-url>       print a Litestream config (fleet or single database)";
+  roomlog backup-config <replica-url>       print a Litestream config (fleet or single database)
+  roomlog cell-create <cell>                create a hosted cell (CELLS_DIR)
+  roomlog cell-list                         cells and tenant counts (CELLS_DIR)
+  roomlog cell-tenant-create <slug> [name] [email]  provision in the least-filled cell (CELLS_DIR, ADMIN_PASSWORD)
+  roomlog cell-route <slug>                 which cell serves a church (CELLS_DIR)
+  roomlog cell-tenant-move <slug> <cell>    move a church to another cell (CELLS_DIR; drain it first)
+  roomlog cell-routes <cell=host:port>...   edge proxy blocks per church (CELLS_DIR, BASE_DOMAIN)";
 
 fn die(msg: String) -> ! {
     eprintln!("{msg}");
@@ -136,6 +143,11 @@ fn tenants_dir() -> Option<std::path::PathBuf> {
 
 fn require_tenants_dir() -> std::path::PathBuf {
     tenants_dir().unwrap_or_else(|| die("Set TENANTS_DIR to the fleet root for tenant commands".into()))
+}
+
+fn require_cells_dir() -> std::path::PathBuf {
+    std::env::var_os("CELLS_DIR").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+        .unwrap_or_else(|| die("Set CELLS_DIR to the cells root for cell commands".into()))
 }
 
 fn abs_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -245,6 +257,57 @@ fn run_file_command(args: &[String]) -> bool {
                     let source = std::env::var("DATABASE_PATH").unwrap_or_else(|_| default_db_path());
                     print!("{}", fleet::litestream_config_single(&abs_path(std::path::Path::new(&source)), replica));
                 }
+            }
+        }
+        Some("cell-create") => {
+            let Some(cell) = args.get(2) else { die("Usage: roomlog cell-create <cell>".into()) };
+            match cells::create_cell(&require_cells_dir(), cell) {
+                Ok(p) => println!("Cell {cell} created (tenants: {})", p.display()),
+                Err(e) => die(e),
+            }
+        }
+        Some("cell-list") => {
+            for (cell, n) in cells::list_cells(&require_cells_dir()) {
+                println!("{cell} {n}");
+            }
+        }
+        Some("cell-tenant-create") => {
+            let Some(slug) = args.get(2) else { die("Usage: roomlog cell-tenant-create <slug> [name] [email]".into()) };
+            let password = std::env::var("ADMIN_PASSWORD")
+                .unwrap_or_else(|_| die("Set ADMIN_PASSWORD for the tenant's first admin account".into()));
+            let name = args.get(3).map(String::as_str).unwrap_or("");
+            let email = args.get(4).map(String::as_str).unwrap_or("");
+            match cells::create_tenant_in_cells(&require_cells_dir(), slug, &password, name, email) {
+                Ok(cell) => println!("Tenant {slug} created in cell {cell}"),
+                Err(e) => die(e),
+            }
+        }
+        Some("cell-route") => {
+            let Some(slug) = args.get(2) else { die("Usage: roomlog cell-route <slug>".into()) };
+            match cells::route(&require_cells_dir(), slug) {
+                Some(cell) => println!("{cell}"),
+                None => die(format!("Unknown tenant {slug}")),
+            }
+        }
+        Some("cell-tenant-move") => {
+            let (Some(slug), Some(cell)) = (args.get(2), args.get(3)) else {
+                die("Usage: roomlog cell-tenant-move <slug> <cell>".into())
+            };
+            match cells::move_tenant(&require_cells_dir(), slug, cell) {
+                Ok((from, to)) => println!("Tenant {slug} moved {from} -> {to}"),
+                Err(e) => die(e),
+            }
+        }
+        Some("cell-routes") => {
+            let base = std::env::var("BASE_DOMAIN").unwrap_or_else(|_| die("Set BASE_DOMAIN for edge routes".into()));
+            let mut upstreams = std::collections::BTreeMap::new();
+            for pair in args.iter().skip(2) {
+                let Some((cell, upstream)) = pair.split_once('=') else { die(format!("Expected <cell=host:port>, got {pair:?}")) };
+                upstreams.insert(cell.to_string(), upstream.to_string());
+            }
+            match cells::edge_routes(&require_cells_dir(), &base, &upstreams) {
+                Ok(text) => print!("{text}"),
+                Err(e) => die(e),
             }
         }
         _ => return false,

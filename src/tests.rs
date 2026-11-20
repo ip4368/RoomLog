@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::auth::{self, Role};
-use crate::{api, app, db, fleet};
+use crate::{api, app, cells, db, fleet};
 
 struct Client {
     app: Router,
@@ -1113,6 +1113,49 @@ fn backup_all_verify_and_drill() {
     // Generated replication configs name the right paths and replica.
     let cfg = fleet::litestream_config_fleet(&dir, &dir.join("meta"), "s3://bucket/roomlog");
     assert!(cfg.contains("roomlog.db") && cfg.contains("s3://bucket/roomlog") && cfg.contains("watch: true"), "{cfg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cells_assign_move_and_routes() {
+    let dir = test_temp_dir("cells");
+    cells::create_cell(&dir, "north").unwrap();
+    cells::create_cell(&dir, "south").unwrap();
+    assert!(cells::create_cell(&dir, "north").is_err());
+    for slug in ["alpha", "beta", "gamma"] {
+        cells::create_tenant_in_cells(&dir, slug, "correct horse", "", "").unwrap();
+    }
+    let counts: std::collections::BTreeMap<String, usize> = cells::list_cells(&dir).into_iter().collect();
+    assert_eq!(counts.values().sum::<usize>(), 3);
+    assert!(counts.values().all(|n| (1..=2).contains(n)), "least-filled assignment: {counts:?}");
+    assert!(cells::create_tenant_in_cells(&dir, "alpha", "correct horse", "", "").is_err(), "duplicate refused");
+
+    // Move alpha (with data and suspended state) to the other cell.
+    let from = cells::route(&dir, "alpha").unwrap();
+    let to = if from == "north" { "south" } else { "north" };
+    let source_tenants = cells::cell_tenants_dir(&dir, &from);
+    {
+        let conn = db::open(fleet::tenant_db_path(&source_tenants, "alpha").to_str().unwrap()).unwrap();
+        conn.execute("INSERT INTO rooms(name) VALUES ('Chapel')", []).unwrap();
+    }
+    fleet::set_suspended(&source_tenants, "alpha", true).unwrap();
+    assert_eq!(cells::move_tenant(&dir, "alpha", to).unwrap(), (from.clone(), to.to_string()));
+    assert_eq!(cells::route(&dir, "alpha").as_deref(), Some(to));
+    assert!(!fleet::tenant_db_path(&source_tenants, "alpha").exists(), "source removed after verified move");
+    let dest_tenants = cells::cell_tenants_dir(&dir, to);
+    assert!(fleet::is_suspended(&dest_tenants, "alpha"), "suspension travels");
+    let conn = db::open(fleet::tenant_db_path(&dest_tenants, "alpha").to_str().unwrap()).unwrap();
+    let name: String = conn.query_row("SELECT name FROM rooms", [], |r| r.get(0)).unwrap();
+    assert_eq!(name, "Chapel");
+    drop(conn);
+    assert!(cells::move_tenant(&dir, "alpha", to).is_err(), "same-cell move refused");
+    assert!(cells::move_tenant(&dir, "alpha", "nowhere").is_err(), "unknown cell refused");
+
+    let upstreams =
+        std::collections::BTreeMap::from([("north".to_string(), "10.0.0.1:8080".to_string()), ("south".to_string(), "10.0.0.2:8080".to_string())]);
+    let routes = cells::edge_routes(&dir, "example.com", &upstreams).unwrap();
+    assert!(routes.contains("alpha.example.com") && routes.contains("reverse_proxy"), "{routes}");
+    assert!(cells::edge_routes(&dir, "example.com", &std::collections::BTreeMap::new()).is_err(), "missing upstream refused");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
